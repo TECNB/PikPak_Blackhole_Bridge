@@ -12,17 +12,26 @@ from datetime import datetime
 
 # ================= Configuration =================
 
-# 1. 本地路径配置 (从环境变量读取)
-WATCH_DIR = os.getenv("WATCH_DIR")
-PROCESSED_DIR = os.getenv("PROCESSED_DIR")
-
-# 2. Alist 配置
+# 1. Alist 认证配置
 ALIST_HOST = os.getenv("ALIST_HOST")
 ALIST_USERNAME = os.getenv("ALIST_USERNAME")
 ALIST_PASSWORD = os.getenv("ALIST_PASSWORD")
 
-# 3. 基础保存路径
-ALIST_BASE_PATH = os.getenv("ALIST_BASE_PATH")
+# 2. 归档根目录
+PROCESSED_DIR = os.getenv("PROCESSED_DIR")
+
+# 3. 监控配置 (路径映射: 本地监控路径 -> 云端基础路径)
+# 注意：这里从环境变量读取，如果未设置则使用默认值
+WATCH_CONFIG = {
+    "TV": {
+        "local": os.getenv("WATCH_DIR_TV", "/data/downloads/incoming/TV"),
+        "cloud": os.getenv("ALIST_PATH_TV", "/pikpak/Media/TV")
+    },
+    "Movie": {
+        "local": os.getenv("WATCH_DIR_MOVIE", "/data/downloads/incoming/Movie"),
+        "cloud": os.getenv("ALIST_PATH_MOVIE", "/pikpak/Media/Movie")
+    }
+}
 
 # 4. 脚本设置
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "10"))
@@ -43,18 +52,16 @@ logger = logging.getLogger(__name__)
 
 # 验证必需的环境变量
 required_vars = {
-    "WATCH_DIR": WATCH_DIR,
     "PROCESSED_DIR": PROCESSED_DIR,
     "ALIST_HOST": ALIST_HOST,
     "ALIST_USERNAME": ALIST_USERNAME,
-    "ALIST_PASSWORD": ALIST_PASSWORD,
-    "ALIST_BASE_PATH": ALIST_BASE_PATH
+    "ALIST_PASSWORD": ALIST_PASSWORD
 }
 
 missing_vars = [key for key, value in required_vars.items() if value is None]
 if missing_vars:
     logger.error(f"缺少必需的环境变量: {', '.join(missing_vars)}")
-    logger.error("请参考 .env.example 文件配置环境变量")
+    logger.error("请参考 .env 文件配置环境变量")
     sys.exit(1)
 
 def login_and_update_token():
@@ -93,7 +100,7 @@ def get_auth_header():
         login_and_update_token()
     return {"Authorization": CURRENT_TOKEN, "Content-Type": "application/json"}
 
-def get_magnet_from_torrent(torrent_path):
+def get_magnet_from_torrent(torrent_path, category_tag):
     """读取 .torrent 并计算磁力"""
     try:
         metadata = bencodepy.decode_from_file(torrent_path)
@@ -102,16 +109,19 @@ def get_magnet_from_torrent(torrent_path):
         digest = hashlib.sha1(hashcontents).digest()
         b32hash = digest.hex()
         magnet = f"magnet:?xt=urn:btih:{b32hash}"
-        logger.info(f"[解析种子] 成功: {os.path.basename(torrent_path)}")
+        logger.info(f"{category_tag} [解析种子] 成功: {os.path.basename(torrent_path)}")
         return magnet
     except Exception as e:
-        logger.error(f"[解析种子] 失败 {torrent_path}: {e}")
+        logger.error(f"{category_tag} [解析种子] 失败 {torrent_path}: {e}")
         return None
 
-def get_save_path(filename):
+def get_save_path(filename, cloud_base_path, category_tag):
     """
     解析文件名并生成保存路径
-    从文件名中提取剧集名称和季度信息，生成对应的目录路径
+    Args:
+        filename: 文件名
+        cloud_base_path: 对应的云端基础路径 (如 /pikpak/Media/TV)
+        category_tag: 日志标签
     """
     base_name = os.path.splitext(filename)[0]
     
@@ -143,12 +153,15 @@ def get_save_path(filename):
             season_folder = f"Season {season_num}"
         
         if clean_name:
-            final_path = f"{ALIST_BASE_PATH}/{clean_name}/{season_folder}"
-            logger.info(f"[路径解析] 提取: [{clean_name}] | 季度: [{season_folder}]")
+            # 确保路径不以 / 结尾再拼接
+            base = cloud_base_path.rstrip('/')
+            final_path = f"{base}/{clean_name}/{season_folder}"
+            logger.info(f"{category_tag} [路径解析] 提取: [{clean_name}] | 季度: [{season_folder}]")
             return final_path
 
-    logger.warning(f"[路径解析] 未匹配到剧集格式，使用默认路径: {ALIST_BASE_PATH}")
-    return ALIST_BASE_PATH
+    # 匹配失败或非剧集格式
+    logger.warning(f"{category_tag} [路径解析] 未匹配到剧集格式，使用基础路径: {cloud_base_path}")
+    return cloud_base_path
 
 def check_alist_path_exists(path):
     """
@@ -195,11 +208,11 @@ def alist_fs_list(path, refresh=True):
     except Exception as e:
         logger.warning(f"[API List] 刷新请求失败 {path}: {e}")
 
-def ensure_path_ready(full_path, max_wait_seconds=30):
+def ensure_path_ready(full_path, category_tag, max_wait_seconds=30):
     """
     逐级创建目录
     """
-    logger.info(f"------ 开始检查云端路径: {full_path} ------")
+    logger.info(f"{category_tag} ------ 开始检查云端路径: {full_path} ------")
     
     parts = [p for p in full_path.split('/') if p]
     current_path = ""
@@ -208,12 +221,13 @@ def ensure_path_ready(full_path, max_wait_seconds=30):
         parent_path = current_path if current_path else "/"
         current_path = f"{current_path}/{part}"
         
-        alist_fs_list(parent_path, refresh=True)
+        # 优化：不频繁刷新根目录，只刷新变动的子目录
+        # alist_fs_list(parent_path, refresh=True) 
         
         if check_alist_path_exists(current_path):
             continue 
             
-        logger.info(f"[Step {i+1}] 目录不存在，正在创建: {current_path}")
+        logger.info(f"{category_tag} [Step {i+1}] 目录不存在，正在创建: {current_path}")
         mkdir_url = f"{ALIST_HOST}/api/fs/mkdir"
         headers = get_auth_header()
         
@@ -224,7 +238,7 @@ def ensure_path_ready(full_path, max_wait_seconds=30):
                 headers = get_auth_header()
                 requests.post(mkdir_url, json={"path": current_path}, headers=headers)
         except Exception as e:
-            logger.error(f"[Mkdir] 创建失败: {e}")
+            logger.error(f"{category_tag} [Mkdir] 创建失败: {e}")
 
         alist_fs_list(parent_path, refresh=True)
         
@@ -234,21 +248,21 @@ def ensure_path_ready(full_path, max_wait_seconds=30):
         while time.time() - layer_start_time < max_wait_seconds:
             if check_alist_path_exists(current_path):
                 layer_ready = True
-                logger.info(f"[Step {i+1}] >> 确认目录就绪: {current_path}")
+                logger.info(f"{category_tag} [Step {i+1}] >> 确认目录就绪: {current_path}")
                 break
             time.sleep(1)
             
         if not layer_ready:
-            logger.error(f"[Timeout] 致命错误: 目录创建后无法在云端确认: {current_path}")
+            logger.error(f"{category_tag} [Timeout] 致命错误: 目录创建后无法在云端确认: {current_path}")
             return False
 
-    logger.info(f"------ 云端路径校验全部通过 ------")
+    logger.info(f"{category_tag} ------ 云端路径校验全部通过 ------")
     return True
 
-def add_offline_download(url, save_path):
+def add_offline_download(url, save_path, category_tag):
     """发送离线下载任务"""
-    if not ensure_path_ready(save_path):
-        logger.error("[任务取消] 目录环境未就绪")
+    if not ensure_path_ready(save_path, category_tag):
+        logger.error(f"{category_tag} [任务取消] 目录环境未就绪")
         return False
 
     api_url = f"{ALIST_HOST}/api/fs/add_offline_download"
@@ -261,12 +275,12 @@ def add_offline_download(url, save_path):
         "delete_policy": "delete_on_upload_succeed"
     }
 
-    logger.info(f"[离线下载] 正在提交任务...")
+    logger.info(f"{category_tag} [离线下载] 正在提交任务...")
     try:
         response = requests.post(api_url, json=payload, headers=headers)
         
         if response.status_code == 401:
-            logger.warning("[离线下载] Token 过期，重新登录并重试...")
+            logger.warning(f"{category_tag} [离线下载] Token 过期，重新登录并重试...")
             if login_and_update_token():
                 headers = get_auth_header()
                 response = requests.post(api_url, json=payload, headers=headers)
@@ -276,83 +290,109 @@ def add_offline_download(url, save_path):
         if response.status_code == 200:
             resp_json = response.json()
             if resp_json.get('code') == 200:
-                logger.info(f"[离线下载] ✅ 任务添加成功! 目标: {save_path}")
+                logger.info(f"{category_tag} [离线下载] ✅ 任务添加成功! 目标: {save_path}")
                 return True
             else:
-                logger.error(f"[离线下载] ❌ Alist 返回错误: {resp_json}")
+                logger.error(f"{category_tag} [离线下载] ❌ Alist 返回错误: {resp_json}")
         else:
-            logger.error(f"[离线下载] ❌ HTTP 错误: {response.status_code}")
+            logger.error(f"{category_tag} [离线下载] ❌ HTTP 错误: {response.status_code}")
     except Exception as e:
-        logger.error(f"[离线下载] 连接异常: {e}")
+        logger.error(f"{category_tag} [离线下载] 连接异常: {e}")
     return False
 
-def process_files():
-    if not os.path.exists(PROCESSED_DIR): os.makedirs(PROCESSED_DIR)
-    if not os.path.exists(WATCH_DIR): return
+def process_single_dir(watch_dir, cloud_base_path, category_name):
+    """
+    处理单个监控目录
+    """
+    category_tag = f"[{category_name}]"
+    
+    if not os.path.exists(watch_dir):
+        logger.warning(f"{category_tag} 监控目录不存在，跳过: {watch_dir}")
+        return
 
-    files = sorted([f for f in os.listdir(WATCH_DIR) if not f.startswith('.')])
+    # 确保归档根目录存在
+    if not os.path.exists(PROCESSED_DIR):
+        os.makedirs(PROCESSED_DIR)
+
+    files = sorted([f for f in os.listdir(watch_dir) if not f.startswith('.')])
 
     for filename in files:
-        file_path = os.path.join(WATCH_DIR, filename)
-        if file_path == PROCESSED_DIR or os.path.isdir(file_path): continue
+        file_path = os.path.join(watch_dir, filename)
+        # 避免处理归档目录（虽然现在归档目录通常在外部，但为了安全保留检查）
+        if file_path == PROCESSED_DIR or os.path.isdir(file_path): 
+            continue
 
-        logger.info(f"发现新文件: {filename}")
+        logger.info(f"{category_tag} 发现新文件: {filename}")
         
         success = False
         magnet = None
-        target_path = ALIST_BASE_PATH
+        target_path = cloud_base_path
         
         if filename.endswith(".torrent"):
-            magnet = get_magnet_from_torrent(file_path)
+            magnet = get_magnet_from_torrent(file_path, category_tag)
         elif filename.endswith(".magnet") or filename.endswith(".txt"):
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     content = f.read().strip()
                     if "magnet:?" in content:
                         magnet = content[content.find("magnet:?"):]
-                        logger.info(f"[读取文本] 成功提取磁力链接")
+                        logger.info(f"{category_tag} [读取文本] 成功提取磁力链接")
             except Exception as e:
-                logger.error(f"[读取文本] 读取失败: {e}")
+                logger.error(f"{category_tag} [读取文本] 读取失败: {e}")
             
         if magnet:
-            target_path = get_save_path(filename)
-            success = add_offline_download(magnet, target_path)
+            target_path = get_save_path(filename, cloud_base_path, category_tag)
+            success = add_offline_download(magnet, target_path, category_tag)
         else:
-            logger.warning(f"无法提取磁力链接，跳过文件: {filename}")
+            logger.warning(f"{category_tag} 无法提取磁力链接，跳过文件: {filename}")
         
         if success:
             try:
                 # 归档逻辑
+                # 计算相对路径，以便在归档目录中保持结构 (如果目标路径比基路径长)
                 relative_path = ""
-                if target_path.startswith(ALIST_BASE_PATH):
-                    relative_path = target_path[len(ALIST_BASE_PATH):].strip("/")
+                if target_path.startswith(cloud_base_path):
+                    # 例如: target=/pikpak/Media/TV/Show/S01, base=/pikpak/Media/TV
+                    # relative = /Show/S01
+                    relative_path = target_path[len(cloud_base_path):].strip("/")
                 
-                local_archive_dir = os.path.join(PROCESSED_DIR, relative_path)
+                # 组合本地归档路径
+                # 将文件按分类 (TV/Movie) 放入归档目录的子文件夹中，避免混淆
+                local_archive_dir = os.path.join(PROCESSED_DIR, category_name, relative_path)
                 
                 if not os.path.exists(local_archive_dir):
                     os.makedirs(local_archive_dir)
                     
                 destination = os.path.join(local_archive_dir, filename)
                 shutil.move(file_path, destination)
-                logger.info(f"[本地归档] ✅ 文件已移至: {local_archive_dir}/{filename}")
+                logger.info(f"{category_tag} [本地归档] ✅ 文件已移至: {local_archive_dir}/{filename}")
                 logger.info("-" * 50) 
                 
             except Exception as e:
-                logger.error(f"[本地归档] 移动失败: {e}")
+                logger.error(f"{category_tag} [本地归档] 移动失败: {e}")
                 logger.error(traceback.format_exc())
 
 def main():
-    logger.info(">>> 自动分类脚本启动 <<<")
-    logger.info(f"监听目录: {WATCH_DIR}")
-    logger.info(f"归档目录: {PROCESSED_DIR}")
+    logger.info(">>> 自动分类脚本启动 (双目录监控版) <<<")
+    logger.info(f"归档总目录: {PROCESSED_DIR}")
     logger.info(f"Alist Host: {ALIST_HOST}")
+    
+    # 打印监控配置
+    for cat, conf in WATCH_CONFIG.items():
+        logger.info(f"配置 [{cat}]: 监控 {conf['local']} -> 上传至 {conf['cloud']}")
     
     if not login_and_update_token():
         logger.error(">>> 启动时登录失败，将在任务中重试 <<<")
 
     while True:
         try:
-            process_files()
+            # 遍历配置的每一个监控目录
+            for category, config in WATCH_CONFIG.items():
+                process_single_dir(
+                    watch_dir=config['local'],
+                    cloud_base_path=config['cloud'],
+                    category_name=category
+                )
         except KeyboardInterrupt:
             logger.info("用户停止脚本")
             break

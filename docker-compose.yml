@@ -10,10 +10,18 @@ services:
     network_mode: "host"
     
     volumes:
-      # 宿主机种子路径 -> 容器监控路径
-      - ./data/watch:/data/watch
+      # 1. TV 监控路径
+      # 宿主机路径: /data/downloads/incoming/TV
+      # 容器内路径: /data/downloads/incoming/TV (保持一致以便于管理)
+      - /data/downloads/incoming/TV:/data/downloads/incoming/TV
       
-      # 宿主机归档路径 -> 容器归档路径
+      # 2. Movie 监控路径
+      # 宿主机路径: /data/downloads/incoming/Movie
+      # 容器内路径: /data/downloads/incoming/Movie
+      - /data/downloads/incoming/Movie:/data/downloads/incoming/Movie
+      
+      # 3. 归档路径
+      # 宿主机路径 -> 容器内路径
       - ./data/processed:/data/processed
 
     # 从 .env 文件读取环境变量

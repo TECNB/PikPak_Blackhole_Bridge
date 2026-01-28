@@ -69,7 +69,7 @@ cp .env.example .env
 3. 启动服务
 
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
 
