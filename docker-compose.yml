@@ -1,0 +1,21 @@
+version: '3'
+
+services:
+  pikpak-bot:
+    build: .
+    container_name: pikpak_bot
+    restart: unless-stopped
+    
+    # 使用 Host 网络模式，网络直通，性能最好且配置最简单
+    network_mode: "host"
+    
+    volumes:
+      # 宿主机种子路径 -> 容器监控路径
+      - ./data/watch:/data/watch
+      
+      # 宿主机归档路径 -> 容器归档路径
+      - ./data/processed:/data/processed
+
+    # 从 .env 文件读取环境变量
+    env_file:
+      - .env
