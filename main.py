@@ -21,7 +21,6 @@ ALIST_PASSWORD = os.getenv("ALIST_PASSWORD")
 PROCESSED_DIR = os.getenv("PROCESSED_DIR")
 
 # 3. 监控配置 (路径映射: 本地监控路径 -> 云端基础路径)
-# 注意：这里从环境变量读取，如果未设置则使用默认值
 WATCH_CONFIG = {
     "TV": {
         "local": os.getenv("WATCH_DIR_TV", "/data/downloads/incoming/TV"),
@@ -118,10 +117,6 @@ def get_magnet_from_torrent(torrent_path, category_tag):
 def get_save_path(filename, cloud_base_path, category_tag):
     """
     解析文件名并生成保存路径
-    Args:
-        filename: 文件名
-        cloud_base_path: 对应的云端基础路径 (如 /pikpak/Media/TV)
-        category_tag: 日志标签
     """
     base_name = os.path.splitext(filename)[0]
     
@@ -186,6 +181,8 @@ def check_alist_path_exists(path):
                 return True
             else:
                 return False
+        else:
+            return False
     except Exception as e:
         logger.error(f"[API Check] 请求异常: {e}")
     return False
@@ -208,25 +205,41 @@ def alist_fs_list(path, refresh=True):
     except Exception as e:
         logger.warning(f"[API List] 刷新请求失败 {path}: {e}")
 
-def ensure_path_ready(full_path, category_tag, max_wait_seconds=30):
+def ensure_path_ready(full_path, skip_prefix_path, category_tag, max_wait_seconds=30):
     """
-    逐级创建目录
+    逐级创建目录 (智能跳过基础路径版)
+    :param full_path: 完整目标路径 (如 /pikpak/Media/TV/Show/S01)
+    :param skip_prefix_path: 需要跳过检查的基础路径 (如 /pikpak/Media/TV)
     """
     logger.info(f"{category_tag} ------ 开始检查云端路径: {full_path} ------")
     
     parts = [p for p in full_path.split('/') if p]
     current_path = ""
     
+    # 规范化 skip_prefix，移除末尾斜杠以确保匹配准确
+    norm_skip_prefix = skip_prefix_path.rstrip('/')
+    
     for i, part in enumerate(parts):
         parent_path = current_path if current_path else "/"
         current_path = f"{current_path}/{part}"
         
-        # 优化：不频繁刷新根目录，只刷新变动的子目录
-        # alist_fs_list(parent_path, refresh=True) 
+        # --- 🛡️ 核心修复：跳过基础路径检查 ---
+        # 如果当前构建的路径是 skip_prefix 的一部分（或者是 skip_prefix 本身）
+        # 我们假设这些基础路径已经由用户配置好并且存在，直接跳过检查和创建。
+        # 逻辑：如果 norm_skip_prefix 以 current_path 开头，说明 current_path 还在基础路径范围内
+        if norm_skip_prefix.startswith(current_path):
+            # logger.debug(f"{category_tag} [Step {i+1}] 跳过基础路径检查: {current_path}")
+            continue
+
+        # --- 以下只针对 "新生成的子目录" (如 剧名/季号) ---
         
-        if check_alist_path_exists(current_path):
-            continue 
-            
+        # 1. 检查是否存在
+        exists = check_alist_path_exists(current_path)
+        
+        if exists:
+            continue
+        
+        # 2. 不存在则创建
         logger.info(f"{category_tag} [Step {i+1}] 目录不存在，正在创建: {current_path}")
         mkdir_url = f"{ALIST_HOST}/api/fs/mkdir"
         headers = get_auth_header()
@@ -238,8 +251,9 @@ def ensure_path_ready(full_path, category_tag, max_wait_seconds=30):
                 headers = get_auth_header()
                 requests.post(mkdir_url, json={"path": current_path}, headers=headers)
         except Exception as e:
-            logger.error(f"{category_tag} [Mkdir] 创建失败: {e}")
+            logger.warning(f"{category_tag} [Mkdir] 请求异常 (可忽略): {e}")
 
+        # 3. 刷新父目录并等待确认
         alist_fs_list(parent_path, refresh=True)
         
         layer_start_time = time.time()
@@ -259,9 +273,10 @@ def ensure_path_ready(full_path, category_tag, max_wait_seconds=30):
     logger.info(f"{category_tag} ------ 云端路径校验全部通过 ------")
     return True
 
-def add_offline_download(url, save_path, category_tag):
+def add_offline_download(url, save_path, cloud_base_path, category_tag):
     """发送离线下载任务"""
-    if not ensure_path_ready(save_path, category_tag):
+    # 将 cloud_base_path 传给 ensure_path_ready 作为 skip_prefix
+    if not ensure_path_ready(save_path, cloud_base_path, category_tag):
         logger.error(f"{category_tag} [任务取消] 目录环境未就绪")
         return False
 
@@ -318,7 +333,7 @@ def process_single_dir(watch_dir, cloud_base_path, category_name):
 
     for filename in files:
         file_path = os.path.join(watch_dir, filename)
-        # 避免处理归档目录（虽然现在归档目录通常在外部，但为了安全保留检查）
+        # 避免处理归档目录
         if file_path == PROCESSED_DIR or os.path.isdir(file_path): 
             continue
 
@@ -342,22 +357,19 @@ def process_single_dir(watch_dir, cloud_base_path, category_name):
             
         if magnet:
             target_path = get_save_path(filename, cloud_base_path, category_tag)
-            success = add_offline_download(magnet, target_path, category_tag)
+            # 修正：传递 cloud_base_path 给 add_offline_download
+            success = add_offline_download(magnet, target_path, cloud_base_path, category_tag)
         else:
             logger.warning(f"{category_tag} 无法提取磁力链接，跳过文件: {filename}")
         
         if success:
             try:
                 # 归档逻辑
-                # 计算相对路径，以便在归档目录中保持结构 (如果目标路径比基路径长)
                 relative_path = ""
                 if target_path.startswith(cloud_base_path):
-                    # 例如: target=/pikpak/Media/TV/Show/S01, base=/pikpak/Media/TV
-                    # relative = /Show/S01
                     relative_path = target_path[len(cloud_base_path):].strip("/")
                 
                 # 组合本地归档路径
-                # 将文件按分类 (TV/Movie) 放入归档目录的子文件夹中，避免混淆
                 local_archive_dir = os.path.join(PROCESSED_DIR, category_name, relative_path)
                 
                 if not os.path.exists(local_archive_dir):
@@ -373,7 +385,7 @@ def process_single_dir(watch_dir, cloud_base_path, category_name):
                 logger.error(traceback.format_exc())
 
 def main():
-    logger.info(">>> 自动分类脚本启动 (双目录监控版) <<<")
+    logger.info(">>> 自动分类脚本启动 (智能基础路径跳过版) <<<")
     logger.info(f"归档总目录: {PROCESSED_DIR}")
     logger.info(f"Alist Host: {ALIST_HOST}")
     
