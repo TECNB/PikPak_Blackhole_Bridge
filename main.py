@@ -8,6 +8,7 @@ import re
 import logging
 import traceback
 import sys
+import json  # 引入json用于美化日志输出
 from datetime import datetime
 
 # ================= Configuration =================
@@ -85,9 +86,9 @@ def login_and_update_token():
                 logger.info(f"[身份验证] ✅ 登录成功，Token 已更新")
                 return True
             else:
-                logger.error(f"[身份验证] ❌ 登录失败: {data.get('message')}")
+                logger.error(f"[身份验证] ❌ 登录失败: {data.get('message')}\n完整响应: {response.text}")
         else:
-            logger.error(f"[身份验证] HTTP 错误: {response.status_code}")
+            logger.error(f"[身份验证] HTTP 错误: {response.status_code}\n完整响应: {response.text}")
     except Exception as e:
         logger.error(f"[身份验证] 连接异常: {e}")
     
@@ -177,11 +178,17 @@ def check_alist_path_exists(path):
 
         if response.status_code == 200:
             data = response.json()
-            if data.get('code') == 200:
+            code = data.get('code')
+            if code == 200:
                 return True
             else:
+                # [DEBUG] 如果不是200，记录一下返回码，方便排查为什么找不到
+                # 只有当 code 不是 200 (成功) 且不是这里预期的 "文件不存在" 逻辑时才需要深度关注
+                # 但为了调试，我们打印出具体为什么失败
+                # logger.debug(f"[API Check Debug] 路径不存在或报错: {path} | Code: {code} | Msg: {data.get('message')}")
                 return False
         else:
+            logger.error(f"[API Check] HTTP异常 {response.status_code} | Path: {path} | Resp: {response.text}")
             return False
     except Exception as e:
         logger.error(f"[API Check] 请求异常: {e}")
@@ -189,7 +196,7 @@ def check_alist_path_exists(path):
 
 def alist_fs_list(path, refresh=True):
     """
-    强制刷新 Alist 缓存
+    强制刷新 Alist 缓存 - 增加详细日志
     """
     api_url = f"{ALIST_HOST}/api/fs/list"
     headers = get_auth_header()
@@ -201,59 +208,74 @@ def alist_fs_list(path, refresh=True):
         "refresh": refresh 
     }
     try:
-        requests.post(api_url, json=payload, headers=headers)
+        logger.info(f"[API List] 正在刷新目录缓存: {path}")
+        resp = requests.post(api_url, json=payload, headers=headers)
+        if resp.status_code != 200:
+            logger.error(f"[API List] HTTP 错误: {resp.status_code} | Body: {resp.text}")
+        else:
+            data = resp.json()
+            if data.get('code') != 200:
+                logger.warning(f"[API List] 刷新返回非200: {data}")
     except Exception as e:
         logger.warning(f"[API List] 刷新请求失败 {path}: {e}")
 
 def ensure_path_ready(full_path, skip_prefix_path, category_tag, max_wait_seconds=30):
     """
-    逐级创建目录 (智能跳过基础路径版)
-    :param full_path: 完整目标路径 (如 /pikpak/Media/TV/Show/S01)
-    :param skip_prefix_path: 需要跳过检查的基础路径 (如 /pikpak/Media/TV)
+    逐级创建目录 (智能跳过基础路径版 + 详细Debug日志)
     """
     logger.info(f"{category_tag} ------ 开始检查云端路径: {full_path} ------")
     
     parts = [p for p in full_path.split('/') if p]
     current_path = ""
     
-    # 规范化 skip_prefix，移除末尾斜杠以确保匹配准确
     norm_skip_prefix = skip_prefix_path.rstrip('/')
     
     for i, part in enumerate(parts):
         parent_path = current_path if current_path else "/"
         current_path = f"{current_path}/{part}"
         
-        # --- 🛡️ 核心修复：跳过基础路径检查 ---
-        # 如果当前构建的路径是 skip_prefix 的一部分（或者是 skip_prefix 本身）
-        # 我们假设这些基础路径已经由用户配置好并且存在，直接跳过检查和创建。
-        # 逻辑：如果 norm_skip_prefix 以 current_path 开头，说明 current_path 还在基础路径范围内
+        # 1. 跳过基础路径
         if norm_skip_prefix.startswith(current_path):
-            # logger.debug(f"{category_tag} [Step {i+1}] 跳过基础路径检查: {current_path}")
             continue
 
-        # --- 以下只针对 "新生成的子目录" (如 剧名/季号) ---
-        
-        # 1. 检查是否存在
+        # 2. 检查是否存在
         exists = check_alist_path_exists(current_path)
         
         if exists:
             continue
         
-        # 2. 不存在则创建
+        # 3. 不存在则创建，增加详细日志
         logger.info(f"{category_tag} [Step {i+1}] 目录不存在，正在创建: {current_path}")
         mkdir_url = f"{ALIST_HOST}/api/fs/mkdir"
         headers = get_auth_header()
         
         try:
+            # [DEBUG] 打印 mkdir 的结果
             resp = requests.post(mkdir_url, json={"path": current_path}, headers=headers)
+            
+            # 处理 Token 过期
             if resp.status_code == 401:
-                login_and_update_token()
-                headers = get_auth_header()
-                requests.post(mkdir_url, json={"path": current_path}, headers=headers)
+                logger.warning(f"{category_tag} [Mkdir] Token 过期，重试...")
+                if login_and_update_token():
+                    headers = get_auth_header()
+                    resp = requests.post(mkdir_url, json={"path": current_path}, headers=headers)
+            
+            # [关键] 无论成功失败，打印详细响应
+            logger.info(f"{category_tag} [Mkdir API] HTTP: {resp.status_code} | Body: {resp.text}")
+            
+            # 检查 API 逻辑错误
+            try:
+                resp_json = resp.json()
+                if resp_json.get('code') != 200:
+                    logger.error(f"{category_tag} [Mkdir Error] 创建指令失败! 错误信息: {resp_json.get('message')}")
+                    # 如果创建都失败了，后面肯定验证不过，这里不退出，看能否靠刷新救回来（通常不行）
+            except:
+                pass
+
         except Exception as e:
             logger.warning(f"{category_tag} [Mkdir] 请求异常 (可忽略): {e}")
 
-        # 3. 刷新父目录并等待确认
+        # 4. 刷新父目录并等待确认
         alist_fs_list(parent_path, refresh=True)
         
         layer_start_time = time.time()
@@ -264,10 +286,13 @@ def ensure_path_ready(full_path, skip_prefix_path, category_tag, max_wait_second
                 layer_ready = True
                 logger.info(f"{category_tag} [Step {i+1}] >> 确认目录就绪: {current_path}")
                 break
-            time.sleep(1)
+            # [DEBUG] 打印等待中的状态，防止看起来像死机
+            # logger.debug(f"{category_tag} ...等待目录生效: {current_path}")
+            time.sleep(2)
             
         if not layer_ready:
             logger.error(f"{category_tag} [Timeout] 致命错误: 目录创建后无法在云端确认: {current_path}")
+            # 这里返回 False 前，可能需要手动去网页版看看目录到底创没创建成功
             return False
 
     logger.info(f"{category_tag} ------ 云端路径校验全部通过 ------")
@@ -302,13 +327,16 @@ def add_offline_download(url, save_path, cloud_base_path, category_tag):
             else:
                 return False
 
+        # [DEBUG] 打印下载接口的响应
+        logger.info(f"{category_tag} [离线下载 API] HTTP: {response.status_code} | Body: {response.text}")
+
         if response.status_code == 200:
             resp_json = response.json()
             if resp_json.get('code') == 200:
                 logger.info(f"{category_tag} [离线下载] ✅ 任务添加成功! 目标: {save_path}")
                 return True
             else:
-                logger.error(f"{category_tag} [离线下载] ❌ Alist 返回错误: {resp_json}")
+                logger.error(f"{category_tag} [离线下载] ❌ Alist 返回错误: {resp_json.get('message')}")
         else:
             logger.error(f"{category_tag} [离线下载] ❌ HTTP 错误: {response.status_code}")
     except Exception as e:
@@ -385,7 +413,7 @@ def process_single_dir(watch_dir, cloud_base_path, category_name):
                 logger.error(traceback.format_exc())
 
 def main():
-    logger.info(">>> 自动分类脚本启动 (智能基础路径跳过版) <<<")
+    logger.info(">>> 自动分类脚本启动 (DEBUG 增强版) <<<")
     logger.info(f"归档总目录: {PROCESSED_DIR}")
     logger.info(f"Alist Host: {ALIST_HOST}")
     
