@@ -8,7 +8,7 @@ import re
 import logging
 import traceback
 import sys
-import json  # 引入json用于美化日志输出
+import json
 from datetime import datetime
 
 # ================= Configuration =================
@@ -100,6 +100,59 @@ def get_auth_header():
         login_and_update_token()
     return {"Authorization": CURRENT_TOKEN, "Content-Type": "application/json"}
 
+def alist_post_request(url, payload, retry=True):
+    """
+    [新增] 通用请求封装函数
+    负责发送 POST 请求，并自动拦截 Token 过期异常进行刷新重试。
+    
+    :param url: 请求地址
+    :param payload: 请求体 JSON 数据
+    :param retry: 是否允许重试（防止无限递归，仅允许重试 1 次）
+    :return: requests.Response 对象
+    """
+    headers = get_auth_header()
+    
+    # 发送原始请求
+    try:
+        response = requests.post(url, json=payload, headers=headers)
+    except requests.exceptions.RequestException as e:
+        # 网络层面的连接错误直接抛出，由业务函数处理
+        raise e
+
+    # 检查 Token 是否失效
+    # 情况 A: HTTP 401
+    # 情况 B: HTTP 200 但业务 Code 提示 Token 过期
+    token_expired = False
+    
+    if response.status_code == 401:
+        token_expired = True
+    elif response.status_code == 200:
+        try:
+            data = response.json()
+            code = data.get('code')
+            msg = data.get('message', '').lower()
+            # Alist 有时返回 200 但 message 包含错误信息
+            if code != 200 and ("token is expired" in msg or "token 无效" in msg):
+                token_expired = True
+        except ValueError:
+            # 解析 JSON 失败，说明不是预期的业务错误，忽略
+            pass
+
+    # 如果 Token 失效且允许重试
+    if token_expired and retry:
+        logger.warning(f"[自动恢复] 检测到 Token 失效 (HTTP {response.status_code})，正在尝试刷新...")
+        
+        # 尝试刷新 Token
+        if login_and_update_token():
+            logger.info("[自动恢复] Token 刷新成功，正在重发请求...")
+            # 递归调用自己，但在重试时关闭 retry 标志，防止死循环
+            return alist_post_request(url, payload, retry=False)
+        else:
+            logger.error("[自动恢复] Token 刷新失败，无法重试，返回原始错误响应。")
+            return response
+
+    return response
+
 def get_magnet_from_torrent(torrent_path, category_tag):
     """读取 .torrent 并计算磁力"""
     try:
@@ -161,31 +214,21 @@ def get_save_path(filename, cloud_base_path, category_tag):
 
 def check_alist_path_exists(path):
     """
-    调用 Alist API 查询路径是否存在
+    调用 Alist API 查询路径是否存在 (使用通用请求函数)
     """
     api_url = f"{ALIST_HOST}/api/fs/get"
-    headers = get_auth_header()
     payload = {"path": path}
     
     try:
-        response = requests.post(api_url, json=payload, headers=headers)
+        # 使用封装的 alist_post_request 替代 requests.post
+        response = alist_post_request(api_url, payload)
         
-        if response.status_code == 401:
-            logger.warning("[API Check] Token 过期，重试...")
-            if login_and_update_token():
-                headers = get_auth_header()
-                response = requests.post(api_url, json=payload, headers=headers)
-
         if response.status_code == 200:
             data = response.json()
             code = data.get('code')
             if code == 200:
                 return True
             else:
-                # [DEBUG] 如果不是200，记录一下返回码，方便排查为什么找不到
-                # 只有当 code 不是 200 (成功) 且不是这里预期的 "文件不存在" 逻辑时才需要深度关注
-                # 但为了调试，我们打印出具体为什么失败
-                # logger.debug(f"[API Check Debug] 路径不存在或报错: {path} | Code: {code} | Msg: {data.get('message')}")
                 return False
         else:
             logger.error(f"[API Check] HTTP异常 {response.status_code} | Path: {path} | Resp: {response.text}")
@@ -196,10 +239,9 @@ def check_alist_path_exists(path):
 
 def alist_fs_list(path, refresh=True):
     """
-    强制刷新 Alist 缓存 - 增加详细日志
+    强制刷新 Alist 缓存 (使用通用请求函数)
     """
     api_url = f"{ALIST_HOST}/api/fs/list"
-    headers = get_auth_header()
     payload = {
         "path": path,
         "password": "",
@@ -209,7 +251,9 @@ def alist_fs_list(path, refresh=True):
     }
     try:
         logger.info(f"[API List] 正在刷新目录缓存: {path}")
-        resp = requests.post(api_url, json=payload, headers=headers)
+        # 使用封装的 alist_post_request 替代 requests.post
+        resp = alist_post_request(api_url, payload)
+        
         if resp.status_code != 200:
             logger.error(f"[API List] HTTP 错误: {resp.status_code} | Body: {resp.text}")
         else:
@@ -247,18 +291,10 @@ def ensure_path_ready(full_path, skip_prefix_path, category_tag, max_wait_second
         # 3. 不存在则创建，增加详细日志
         logger.info(f"{category_tag} [Step {i+1}] 目录不存在，正在创建: {current_path}")
         mkdir_url = f"{ALIST_HOST}/api/fs/mkdir"
-        headers = get_auth_header()
         
         try:
-            # [DEBUG] 打印 mkdir 的结果
-            resp = requests.post(mkdir_url, json={"path": current_path}, headers=headers)
-            
-            # 处理 Token 过期
-            if resp.status_code == 401:
-                logger.warning(f"{category_tag} [Mkdir] Token 过期，重试...")
-                if login_and_update_token():
-                    headers = get_auth_header()
-                    resp = requests.post(mkdir_url, json={"path": current_path}, headers=headers)
+            # 使用封装的 alist_post_request 替代 requests.post
+            resp = alist_post_request(mkdir_url, {"path": current_path})
             
             # [关键] 无论成功失败，打印详细响应
             logger.info(f"{category_tag} [Mkdir API] HTTP: {resp.status_code} | Body: {resp.text}")
@@ -268,7 +304,6 @@ def ensure_path_ready(full_path, skip_prefix_path, category_tag, max_wait_second
                 resp_json = resp.json()
                 if resp_json.get('code') != 200:
                     logger.error(f"{category_tag} [Mkdir Error] 创建指令失败! 错误信息: {resp_json.get('message')}")
-                    # 如果创建都失败了，后面肯定验证不过，这里不退出，看能否靠刷新救回来（通常不行）
             except:
                 pass
 
@@ -286,27 +321,23 @@ def ensure_path_ready(full_path, skip_prefix_path, category_tag, max_wait_second
                 layer_ready = True
                 logger.info(f"{category_tag} [Step {i+1}] >> 确认目录就绪: {current_path}")
                 break
-            # [DEBUG] 打印等待中的状态，防止看起来像死机
-            # logger.debug(f"{category_tag} ...等待目录生效: {current_path}")
             time.sleep(2)
             
         if not layer_ready:
             logger.error(f"{category_tag} [Timeout] 致命错误: 目录创建后无法在云端确认: {current_path}")
-            # 这里返回 False 前，可能需要手动去网页版看看目录到底创没创建成功
             return False
 
     logger.info(f"{category_tag} ------ 云端路径校验全部通过 ------")
     return True
 
 def add_offline_download(url, save_path, cloud_base_path, category_tag):
-    """发送离线下载任务"""
+    """发送离线下载任务 (使用通用请求函数)"""
     # 将 cloud_base_path 传给 ensure_path_ready 作为 skip_prefix
     if not ensure_path_ready(save_path, cloud_base_path, category_tag):
         logger.error(f"{category_tag} [任务取消] 目录环境未就绪")
         return False
 
     api_url = f"{ALIST_HOST}/api/fs/add_offline_download"
-    headers = get_auth_header()
     
     payload = {
         "path": save_path, 
@@ -317,15 +348,8 @@ def add_offline_download(url, save_path, cloud_base_path, category_tag):
 
     logger.info(f"{category_tag} [离线下载] 正在提交任务...")
     try:
-        response = requests.post(api_url, json=payload, headers=headers)
-        
-        if response.status_code == 401:
-            logger.warning(f"{category_tag} [离线下载] Token 过期，重新登录并重试...")
-            if login_and_update_token():
-                headers = get_auth_header()
-                response = requests.post(api_url, json=payload, headers=headers)
-            else:
-                return False
+        # 使用封装的 alist_post_request 替代 requests.post
+        response = alist_post_request(api_url, payload)
 
         # [DEBUG] 打印下载接口的响应
         logger.info(f"{category_tag} [离线下载 API] HTTP: {response.status_code} | Body: {response.text}")
@@ -413,7 +437,7 @@ def process_single_dir(watch_dir, cloud_base_path, category_name):
                 logger.error(traceback.format_exc())
 
 def main():
-    logger.info(">>> 自动分类脚本启动 (DEBUG 增强版) <<<")
+    logger.info(">>> 自动分类脚本启动 (Token 自动刷新版) <<<")
     logger.info(f"归档总目录: {PROCESSED_DIR}")
     logger.info(f"Alist Host: {ALIST_HOST}")
     
@@ -422,7 +446,7 @@ def main():
         logger.info(f"配置 [{cat}]: 监控 {conf['local']} -> 上传至 {conf['cloud']}")
     
     if not login_and_update_token():
-        logger.error(">>> 启动时登录失败，将在任务中重试 <<<")
+        logger.error(">>> 启动时登录失败，将在任务中自动重试 <<<")
 
     while True:
         try:
