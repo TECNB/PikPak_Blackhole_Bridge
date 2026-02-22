@@ -191,6 +191,18 @@ def get_save_path(filename, cloud_base_path, category_tag):
             clean_title = re.sub(r'\[.*?\]|【.*?】', '', raw_title).strip()
             clean_title = re.sub(r'\s+', ' ', clean_title).strip()
 
+            # 多语标题干扰处理:
+            # 例如 "Выживший + The Revenant" 优先保留英文标题段
+            if clean_title:
+                title_parts = [p.strip(" -._") for p in re.split(r'\s*[+/|]+\s*', clean_title) if p.strip(" -._")]
+                if title_parts:
+                    ascii_parts = [p for p in title_parts if re.search(r'[A-Za-z]', p)]
+                    if ascii_parts:
+                        clean_title = max(ascii_parts, key=lambda p: len(re.findall(r'[A-Za-z]', p)))
+                    else:
+                        clean_title = title_parts[-1]
+                    clean_title = re.sub(r'\s+', ' ', clean_title).strip()
+
             if clean_title:
                 movie_folder = f"{clean_title} ({release_year})"
                 base = cloud_base_path.rstrip('/')
