@@ -173,6 +173,33 @@ def get_save_path(filename, cloud_base_path, category_tag):
     解析文件名并生成保存路径
     """
     base_name = os.path.splitext(filename)[0]
+    category_name = category_tag.strip("[]").lower()
+
+    # 电影专属规则: {Movie Title} ({Release Year})
+    if category_name == "movie":
+        normalized_name = base_name.replace(".", " ").replace("_", " ")
+        normalized_name = re.sub(r'\s+', ' ', normalized_name).strip()
+        # 模式1: Title (Year) / Title [Year]
+        movie_match = re.match(r'^(.*?)\s*[\(\[]((?:19|20)\d{2})[\)\]](?:\s|$)', normalized_name)
+        # 模式2: Title Year 其他发布信息
+        if not movie_match:
+            movie_match = re.match(r'^(.*?)\s((?:19|20)\d{2})(?:\s|$)', normalized_name)
+
+        if movie_match:
+            raw_title = movie_match.group(1).strip(" -._")
+            release_year = movie_match.group(2)
+            clean_title = re.sub(r'\[.*?\]|【.*?】', '', raw_title).strip()
+            clean_title = re.sub(r'\s+', ' ', clean_title).strip()
+
+            if clean_title:
+                movie_folder = f"{clean_title} ({release_year})"
+                base = cloud_base_path.rstrip('/')
+                final_path = f"{base}/{movie_folder}"
+                logger.info(f"{category_tag} [路径解析] 电影提取: [{movie_folder}]")
+                return final_path
+
+        logger.warning(f"{category_tag} [路径解析] 未匹配到电影格式，使用基础路径: {cloud_base_path}")
+        return cloud_base_path
     
     # 1. 去除所有括号内容
     base_name = re.sub(r'\[.*?\]', '', base_name)
