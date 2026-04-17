@@ -9,7 +9,11 @@ import logging
 import traceback
 import sys
 import json
+import unicodedata
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime
+from threading import Lock, Thread
+from urllib.parse import urlparse, unquote
 
 # ================= Configuration =================
 
@@ -36,10 +40,19 @@ WATCH_CONFIG = {
 # 4. 脚本设置
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "10"))
 
+# 5. Webhook 设置
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0")
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8787"))
+WEBHOOK_PATHS = {"/webhook", "/webhook/radarr", "/radarr/webhook"}
+WEBHOOK_MAX_BODY_BYTES = int(os.getenv("WEBHOOK_MAX_BODY_BYTES", "1048576"))
+PENDING_TASK_FILE = os.getenv("PENDING_TASK_FILE")
+
 # =================================================
 
 # 全局变量存储 Token
 CURRENT_TOKEN = ""
+PENDING_TASKS = {}
+PENDING_TASKS_LOCK = Lock()
 
 # 配置日志格式 (输出到控制台)
 logging.basicConfig(
@@ -63,6 +76,9 @@ if missing_vars:
     logger.error(f"缺少必需的环境变量: {', '.join(missing_vars)}")
     logger.error("请参考 .env 文件配置环境变量")
     sys.exit(1)
+
+if not PENDING_TASK_FILE:
+    PENDING_TASK_FILE = os.path.join(PROCESSED_DIR, "radarr_pending_tasks.json")
 
 def login_and_update_token():
     """
@@ -152,6 +168,243 @@ def alist_post_request(url, payload, retry=True):
             return response
 
     return response
+
+def normalize_release_title(value):
+    """
+    将 Radarr releaseTitle 和黑洞文件名归一成同一个可比对 key。
+    只做格式标准化，不尝试从名称里推断影片信息。
+    """
+    if not value:
+        return ""
+
+    text = unquote(str(value))
+    text = unicodedata.normalize("NFKC", text).lower()
+    text = re.sub(r'[\W_]+', ' ', text, flags=re.UNICODE)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+def get_file_release_key(filename):
+    """取黑洞文件名主干并生成 releaseTitle 匹配 key。"""
+    base_name = os.path.splitext(os.path.basename(filename))[0]
+    return normalize_release_title(base_name)
+
+def sanitize_path_component(value):
+    """清理路径分段，避免电影标题中的路径分隔符产生意外子目录。"""
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    text = re.sub(r'[\\/]+', ' - ', text)
+    text = re.sub(r'[\x00-\x1f\x7f]+', '', text)
+    text = re.sub(r'\s+', ' ', text).strip(" .")
+    return text
+
+def save_pending_tasks_locked():
+    """持久化 pending webhook 任务。调用方需持有 PENDING_TASKS_LOCK。"""
+    pending_dir = os.path.dirname(PENDING_TASK_FILE)
+    if pending_dir:
+        os.makedirs(pending_dir, exist_ok=True)
+
+    tmp_path = f"{PENDING_TASK_FILE}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(PENDING_TASKS, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, PENDING_TASK_FILE)
+
+def load_pending_tasks():
+    """启动时加载未匹配的 Radarr Grab webhook 任务。"""
+    global PENDING_TASKS
+
+    if not os.path.exists(PENDING_TASK_FILE):
+        logger.info(f"[Webhook] Pending 任务文件不存在，将在首次写入时创建: {PENDING_TASK_FILE}")
+        return
+
+    try:
+        with open(PENDING_TASK_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not isinstance(data, dict):
+            logger.warning(f"[Webhook] Pending 任务文件格式异常，已忽略: {PENDING_TASK_FILE}")
+            return
+
+        with PENDING_TASKS_LOCK:
+            PENDING_TASKS = {
+                key: task for key, task in data.items()
+                if isinstance(key, str) and isinstance(task, dict)
+            }
+
+        logger.info(f"[Webhook] 已加载 Radarr pending 任务: {len(PENDING_TASKS)} 个")
+    except Exception as e:
+        logger.error(f"[Webhook] 加载 pending 任务失败: {e}")
+
+def register_radarr_grab(payload):
+    """记录 Radarr Grab webhook，等待黑洞文件按 releaseTitle 命中。"""
+    event_type = payload.get("eventType")
+    if event_type != "Grab":
+        return {"ignored": True, "reason": f"eventType={event_type}"}
+
+    movie = payload.get("movie") or {}
+    remote_movie = payload.get("remoteMovie") or {}
+    release = payload.get("release") or {}
+
+    release_title = release.get("releaseTitle")
+    movie_title = movie.get("title") or remote_movie.get("title")
+    movie_year = movie.get("year") or remote_movie.get("year")
+
+    if not release_title:
+        raise ValueError("缺少 release.releaseTitle")
+    if not movie_title:
+        raise ValueError("缺少 movie.title")
+    if not movie_year:
+        raise ValueError("缺少 movie.year")
+
+    release_key = normalize_release_title(release_title)
+    if not release_key:
+        raise ValueError("release.releaseTitle 标准化后为空")
+
+    task = {
+        "category": "Movie",
+        "release_key": release_key,
+        "release_title": release_title,
+        "received_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "movie": {
+            "id": movie.get("id"),
+            "title": movie_title,
+            "year": movie_year,
+            "tmdbId": movie.get("tmdbId") or remote_movie.get("tmdbId"),
+            "imdbId": movie.get("imdbId") or remote_movie.get("imdbId"),
+            "folderPath": movie.get("folderPath")
+        },
+        "release": {
+            "quality": release.get("quality"),
+            "releaseGroup": release.get("releaseGroup"),
+            "indexer": release.get("indexer"),
+            "size": release.get("size")
+        }
+    }
+
+    with PENDING_TASKS_LOCK:
+        PENDING_TASKS[release_key] = task
+        save_pending_tasks_locked()
+
+    logger.info(f"[Webhook] 已记录 Radarr Grab: {movie_title} ({movie_year}) | releaseTitle: {release_title}")
+    return {"ignored": False, "release_key": release_key, "movie": f"{movie_title} ({movie_year})"}
+
+def find_pending_movie_task(filename, category_tag):
+    """按标准化后的 releaseTitle 查找黑洞文件对应的 Radarr Grab 任务。"""
+    release_key = get_file_release_key(filename)
+    if not release_key:
+        return None, None
+
+    with PENDING_TASKS_LOCK:
+        task = PENDING_TASKS.get(release_key)
+
+    if task:
+        movie = task.get("movie") or {}
+        logger.info(
+            f"{category_tag} [Webhook匹配] 命中: {movie.get('title')} ({movie.get('year')}) | 文件: {filename}"
+        )
+        return release_key, task
+
+    logger.warning(f"{category_tag} [Webhook匹配] 未找到匹配的 Grab 任务，暂不处理: {filename}")
+    return release_key, None
+
+def remove_pending_movie_task(release_key, category_tag):
+    """离线任务提交成功后移除 pending webhook 任务。"""
+    if not release_key:
+        return
+
+    with PENDING_TASKS_LOCK:
+        if release_key not in PENDING_TASKS:
+            return
+        task = PENDING_TASKS.pop(release_key)
+        save_pending_tasks_locked()
+
+    movie = task.get("movie") or {}
+    logger.info(f"{category_tag} [Webhook匹配] 已清理 pending 任务: {movie.get('title')} ({movie.get('year')})")
+
+def get_movie_save_path_from_task(task, cloud_base_path, category_tag):
+    """用 Radarr webhook 的 movie.title/year 直接生成电影保存目录。"""
+    movie = task.get("movie") or {}
+    title = sanitize_path_component(movie.get("title"))
+    year = str(movie.get("year") or "").strip()
+
+    if not title or not year:
+        logger.warning(f"{category_tag} [路径解析] Webhook 电影信息不完整，使用基础路径: {cloud_base_path}")
+        return cloud_base_path
+
+    movie_folder = f"{title} ({year})"
+    base = cloud_base_path.rstrip("/")
+    final_path = f"{base}/{movie_folder}"
+    logger.info(f"{category_tag} [路径解析] Webhook 电影目录: [{movie_folder}]")
+    return final_path
+
+def write_json_response(handler, status_code, payload):
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    handler.send_response(status_code)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+class WebhookRequestHandler(BaseHTTPRequestHandler):
+    server_version = "PikPakBlackholeBridgeWebhook/1.0"
+
+    def do_GET(self):
+        path = urlparse(self.path).path.rstrip("/") or "/"
+        if path == "/health":
+            write_json_response(self, 200, {"ok": True, "service": "pikpak-blackhole-bridge"})
+            return
+        write_json_response(self, 404, {"ok": False, "error": "not found"})
+
+    def do_POST(self):
+        path = urlparse(self.path).path.rstrip("/") or "/"
+        if path not in WEBHOOK_PATHS:
+            write_json_response(self, 404, {"ok": False, "error": "not found"})
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            write_json_response(self, 400, {"ok": False, "error": "invalid Content-Length"})
+            return
+
+        if length <= 0:
+            write_json_response(self, 400, {"ok": False, "error": "empty body"})
+            return
+        if length > WEBHOOK_MAX_BODY_BYTES:
+            write_json_response(self, 413, {"ok": False, "error": "body too large"})
+            return
+
+        try:
+            raw_body = self.rfile.read(length)
+            payload = json.loads(raw_body.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("JSON body must be an object")
+
+            result = register_radarr_grab(payload)
+            write_json_response(self, 200, {"ok": True, **result})
+        except json.JSONDecodeError as e:
+            write_json_response(self, 400, {"ok": False, "error": f"invalid json: {e}"})
+        except ValueError as e:
+            write_json_response(self, 400, {"ok": False, "error": str(e)})
+        except Exception as e:
+            logger.error(f"[Webhook] 处理请求失败: {e}")
+            logger.error(traceback.format_exc())
+            write_json_response(self, 500, {"ok": False, "error": "internal server error"})
+
+    def log_message(self, fmt, *args):
+        logger.debug(f"[Webhook] {self.address_string()} - {fmt % args}")
+
+def start_webhook_server():
+    """启动 Radarr Grab webhook HTTP 服务。"""
+    try:
+        server = ThreadingHTTPServer((WEBHOOK_HOST, WEBHOOK_PORT), WebhookRequestHandler)
+    except OSError as e:
+        logger.error(f"[Webhook] 启动失败 {WEBHOOK_HOST}:{WEBHOOK_PORT}: {e}")
+        return None
+
+    thread = Thread(target=server.serve_forever, name="radarr-webhook-server", daemon=True)
+    thread.start()
+    paths = ", ".join(sorted(WEBHOOK_PATHS))
+    logger.info(f"[Webhook] 已启动: http://{WEBHOOK_HOST}:{WEBHOOK_PORT} ({paths})")
+    return server
 
 def get_magnet_from_torrent(torrent_path, category_tag):
     """读取 .torrent 并计算磁力"""
@@ -433,27 +686,43 @@ def process_single_dir(watch_dir, cloud_base_path, category_name):
         success = False
         magnet = None
         target_path = cloud_base_path
+        pending_release_key = None
+        pending_movie_task = None
+        is_movie = category_name.lower() == "movie"
+
+        if is_movie:
+            pending_release_key, pending_movie_task = find_pending_movie_task(filename, category_tag)
+            if not pending_movie_task:
+                continue
         
-        if filename.endswith(".torrent"):
+        lower_filename = filename.lower()
+        if lower_filename.endswith(".torrent"):
             magnet = get_magnet_from_torrent(file_path, category_tag)
-        elif filename.endswith(".magnet") or filename.endswith(".txt"):
+        elif lower_filename.endswith(".magnet") or lower_filename.endswith(".txt"):
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     content = f.read().strip()
-                    if "magnet:?" in content:
-                        magnet = content[content.find("magnet:?"):]
+                    magnet_match = re.search(r'magnet:\?[^\s]+', content)
+                    if magnet_match:
+                        magnet = magnet_match.group(0)
                         logger.info(f"{category_tag} [读取文本] 成功提取磁力链接")
             except Exception as e:
                 logger.error(f"{category_tag} [读取文本] 读取失败: {e}")
             
         if magnet:
-            target_path = get_save_path(filename, cloud_base_path, category_tag)
+            if pending_movie_task:
+                target_path = get_movie_save_path_from_task(pending_movie_task, cloud_base_path, category_tag)
+            else:
+                target_path = get_save_path(filename, cloud_base_path, category_tag)
             # 修正：传递 cloud_base_path 给 add_offline_download
             success = add_offline_download(magnet, target_path, cloud_base_path, category_tag)
         else:
             logger.warning(f"{category_tag} 无法提取磁力链接，跳过文件: {filename}")
         
         if success:
+            if pending_movie_task:
+                remove_pending_movie_task(pending_release_key, category_tag)
+
             try:
                 # 归档逻辑
                 relative_path = ""
@@ -479,6 +748,8 @@ def main():
     logger.info(">>> 自动分类脚本启动 (Token 自动刷新版) <<<")
     logger.info(f"归档总目录: {PROCESSED_DIR}")
     logger.info(f"Alist Host: {ALIST_HOST}")
+    load_pending_tasks()
+    webhook_server = start_webhook_server()
     
     # 打印监控配置
     for cat, conf in WATCH_CONFIG.items():
@@ -498,6 +769,8 @@ def main():
                 )
         except KeyboardInterrupt:
             logger.info("用户停止脚本")
+            if webhook_server:
+                webhook_server.shutdown()
             break
         except Exception as e:
             logger.error(f"主循环发生未捕获异常: {e}")

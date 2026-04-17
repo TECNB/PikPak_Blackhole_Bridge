@@ -29,6 +29,8 @@ Sonarr/Radarr 负责搜刮资源，将种子扔进“黑洞”。
 
 - 自动识别剧集名称 (S01, S02...)。
 
+- Radarr 电影 Grab 可通过 Webhook 提供 `movie.title`、`movie.year`、`release.releaseTitle`，黑洞文件只负责提供真正的磁力信息，电影目录固定生成为 `{电影名} ({年份})`。
+
 
 - 清洗文件名（去除分辨率、制作组等冗余信息）。
 
@@ -108,6 +110,13 @@ PROCESSED_DIR=/data/processed
 
 # 扫描频率 (秒)
 CHECK_INTERVAL=10
+
+# Radarr Grab Webhook 服务
+# Radarr -> Settings -> Connect -> Webhook
+# URL: http://<本机IP>:8787/webhook/radarr
+WEBHOOK_HOST=0.0.0.0
+WEBHOOK_PORT=8787
+PENDING_TASK_FILE=/data/processed/radarr_pending_tasks.json
 ```
 
 
@@ -120,6 +129,16 @@ CHECK_INTERVAL=10
 Torrent Folder: 设置为本项目 watch 目录在宿主机上的路径（例如 /data/downloads）。
 
 Watch Folder: 设置为任意空文件夹（本项目只负责处理种子，下载进度的监控通常依赖云端挂载的回扫）。
+
+### Radarr 电影目录匹配
+
+Radarr 的 Torrent Blackhole Grab Webhook 不会提供磁力本体，但会提供结构化的影片与发布信息。本工具会先记录 Grab 事件，再等待 Movie 黑洞目录出现同名发布文件：
+
+- Webhook 地址：`http://<本机IP>:8787/webhook/radarr`
+- 触发事件：选择 Grab
+- 匹配字段：`release.releaseTitle` 标准化后匹配黑洞文件名主干
+- 磁力来源：`.torrent` 计算 BTIH，或从 `.magnet` / `.txt` 内提取 `magnet:?xt=urn:btih:...`
+- 电影保存目录：`ALIST_PATH_MOVIE/movie.title (movie.year)`
 
 ## 📅 路线图
 
