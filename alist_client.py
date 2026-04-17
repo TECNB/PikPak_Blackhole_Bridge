@@ -8,9 +8,11 @@ import requests
 import state
 from config import (
     ALIST_HOST,
+    ALIST_PATH_MOVIE,
     ALIST_PASSWORD,
     ALIST_USERNAME,
     CD2_HOST,
+    CD2_MOVIE_BASE_PATH,
     CD2_REFRESH_ENABLED,
     CD2_REFRESH_MAX_ATTEMPTS,
     CD2_REFRESH_POLL_INTERVAL,
@@ -282,8 +284,27 @@ def confirm_cd2_movie_path_ready(movie_path, category_tag):
         logger.warning(f"{category_tag} [CD2刷新] 影片路径为空，跳过确认")
         return False
 
-    if "/" in normalized_path:
-        parent_path, _ = normalized_path.rsplit("/", 1)
+    cd2_movie_path = normalized_path
+    if CD2_MOVIE_BASE_PATH:
+        normalized_movie_base = ALIST_PATH_MOVIE.rstrip("/")
+        if normalized_path == normalized_movie_base:
+            cd2_movie_path = CD2_MOVIE_BASE_PATH
+        elif normalized_path.startswith(f"{normalized_movie_base}/"):
+            relative_path = normalized_path[len(normalized_movie_base):]
+            cd2_movie_path = f"{CD2_MOVIE_BASE_PATH}{relative_path}"
+        else:
+            logger.warning(
+                f"{category_tag} [CD2刷新] 电影路径不在 ALIST_PATH_MOVIE 下，"
+                f"将直接使用原路径查询 CD2: {normalized_path}"
+            )
+
+    if cd2_movie_path != normalized_path:
+        logger.info(
+            f"{category_tag} [CD2刷新] 路径映射: {normalized_path} -> {cd2_movie_path}"
+        )
+
+    if "/" in cd2_movie_path:
+        parent_path, _ = cd2_movie_path.rsplit("/", 1)
         if not parent_path:
             parent_path = "/"
     else:
@@ -291,13 +312,13 @@ def confirm_cd2_movie_path_ready(movie_path, category_tag):
 
     for attempt in range(1, CD2_REFRESH_MAX_ATTEMPTS + 1):
         cd2_list_dir(parent_path, refresh=True, per_page=1)
-        path_info = cd2_get_path_info(normalized_path, refresh=True)
-        entries = cd2_list_dir(normalized_path, refresh=True, per_page=MOVIE_FLATTEN_LIST_PER_PAGE)
+        path_info = cd2_get_path_info(cd2_movie_path, refresh=True)
+        entries = cd2_list_dir(cd2_movie_path, refresh=True, per_page=MOVIE_FLATTEN_LIST_PER_PAGE)
 
         if path_info is not None and entries is not None:
             logger.info(
                 f"{category_tag} [CD2刷新] CD2 已刷新并看到最终影片目录: "
-                f"{normalized_path} | 子项 {len(entries)} 个 "
+                f"{cd2_movie_path} | 子项 {len(entries)} 个 "
                 f"({attempt}/{CD2_REFRESH_MAX_ATTEMPTS})"
             )
             return True
@@ -305,13 +326,13 @@ def confirm_cd2_movie_path_ready(movie_path, category_tag):
         if attempt < CD2_REFRESH_MAX_ATTEMPTS:
             logger.info(
                 f"{category_tag} [CD2刷新] CD2 暂未看到最终影片目录，等待重试: "
-                f"{normalized_path} ({attempt}/{CD2_REFRESH_MAX_ATTEMPTS})"
+                f"{cd2_movie_path} ({attempt}/{CD2_REFRESH_MAX_ATTEMPTS})"
             )
             time.sleep(CD2_REFRESH_POLL_INTERVAL)
 
     logger.warning(
         f"{category_tag} [CD2刷新] CD2 未找到影片目录: "
-        f"{normalized_path} ({CD2_REFRESH_MAX_ATTEMPTS} 次)"
+        f"{cd2_movie_path} ({CD2_REFRESH_MAX_ATTEMPTS} 次)"
     )
     return False
 

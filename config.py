@@ -8,32 +8,36 @@ ALIST_HOST = os.getenv("ALIST_HOST")
 ALIST_USERNAME = os.getenv("ALIST_USERNAME")
 ALIST_PASSWORD = os.getenv("ALIST_PASSWORD")
 
-# 2. 归档根目录
+# 2. 云端基础保存路径
+ALIST_PATH_TV = os.getenv("ALIST_PATH_TV", "/pikpak/Media/TV")
+ALIST_PATH_MOVIE = os.getenv("ALIST_PATH_MOVIE", "/pikpak/Media/Movie")
+
+# 3. 归档根目录
 PROCESSED_DIR = os.getenv("PROCESSED_DIR")
 
-# 3. 监控配置 (路径映射: 本地监控路径 -> 云端基础路径)
+# 4. 监控配置 (路径映射: 本地监控路径 -> 云端基础路径)
 WATCH_CONFIG = {
     "TV": {
         "local": os.getenv("WATCH_DIR_TV", "/data/downloads/incoming/TV"),
-        "cloud": os.getenv("ALIST_PATH_TV", "/pikpak/Media/TV"),
+        "cloud": ALIST_PATH_TV,
     },
     "Movie": {
         "local": os.getenv("WATCH_DIR_MOVIE", "/data/downloads/incoming/Movie"),
-        "cloud": os.getenv("ALIST_PATH_MOVIE", "/pikpak/Media/Movie"),
+        "cloud": ALIST_PATH_MOVIE,
     },
 }
 
-# 4. 脚本设置
+# 5. 脚本设置
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "10"))
 
-# 5. Webhook 设置
+# 6. Webhook 设置
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0")
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8787"))
 WEBHOOK_PATHS = {"/webhook", "/webhook/radarr", "/radarr/webhook"}
 WEBHOOK_MAX_BODY_BYTES = int(os.getenv("WEBHOOK_MAX_BODY_BYTES", "1048576"))
 PENDING_TASK_FILE = os.getenv("PENDING_TASK_FILE")
 
-# 6. 电影下载完成后的保守型单层包装目录拍平
+# 7. 电影下载完成后的保守型单层包装目录拍平
 MOVIE_FLATTEN_ENABLED = os.getenv("MOVIE_FLATTEN_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 MOVIE_FLATTEN_TASK_FILE = os.getenv("MOVIE_FLATTEN_TASK_FILE")
 MOVIE_FLATTEN_STABLE_CHECKS = int(os.getenv("MOVIE_FLATTEN_STABLE_CHECKS", "2"))
@@ -44,10 +48,11 @@ MOVIE_CONTENT_MAX_ATTEMPTS = int(os.getenv("MOVIE_CONTENT_MAX_ATTEMPTS", "10"))
 PATH_READY_POLL_INTERVAL = int(os.getenv("PATH_READY_POLL_INTERVAL", "2"))
 PATH_READY_MAX_ATTEMPTS = int(os.getenv("PATH_READY_MAX_ATTEMPTS", "10"))
 
-# 7. 可选的 CD2 目录刷新确认
+# 8. 可选的 CD2 目录刷新确认
 CD2_REFRESH_ENABLED = os.getenv("CD2_REFRESH_ENABLED", "false").lower() in ("1", "true", "yes", "on")
 CD2_HOST = os.getenv("CD2_HOST", "").rstrip("/")
 CD2_TOKEN = os.getenv("CD2_TOKEN", "").strip()
+CD2_MOVIE_BASE_PATH = os.getenv("CD2_MOVIE_BASE_PATH", "").rstrip("/")
 CD2_REFRESH_POLL_INTERVAL = int(os.getenv("CD2_REFRESH_POLL_INTERVAL", "10"))
 CD2_REFRESH_MAX_ATTEMPTS = int(os.getenv("CD2_REFRESH_MAX_ATTEMPTS", "5"))
 
