@@ -117,6 +117,19 @@ CHECK_INTERVAL=10
 WEBHOOK_HOST=0.0.0.0
 WEBHOOK_PORT=8787
 PENDING_TASK_FILE=/data/processed/radarr_pending_tasks.json
+
+# 电影下载完成后的保守型单层包装目录拍平
+# 仅 Movie 生效；TV/剧集不会参与整理
+MOVIE_FLATTEN_ENABLED=true
+MOVIE_FLATTEN_TASK_FILE=/data/processed/movie_flatten_tasks.json
+MOVIE_CONTENT_POLL_INTERVAL=6
+MOVIE_CONTENT_MAX_ATTEMPTS=10
+MOVIE_FLATTEN_STABLE_CHECKS=2
+MOVIE_FLATTEN_MAX_TASKS_PER_LOOP=3
+
+# 云端目录确认短轮询
+PATH_READY_POLL_INTERVAL=2
+PATH_READY_MAX_ATTEMPTS=10
 ```
 
 
@@ -139,6 +152,14 @@ Radarr 的 Torrent Blackhole Grab Webhook 不会提供磁力本体，但会提�
 - 匹配字段：`release.releaseTitle` 标准化后匹配黑洞文件名主干
 - 磁力来源：`.torrent` 计算 BTIH，或从 `.magnet` / `.txt` 内提取 `magnet:?xt=urn:btih:...`
 - 电影保存目录：`ALIST_PATH_MOVIE/movie.title (movie.year)`
+
+电影离线任务提交成功后，工具会登记一个后处理任务。整理分为两阶段：先用 `refresh=true` 短轮询等待目标目录出现内容；首次出现内容后，再等待连续 2 次目录快照一致，然后做保守型单层包装目录检查：
+
+- 根目录存在唯一包装子目录：将该子目录内容移动到电影根目录，再删除空子目录，兼容 4K/1080p 等多版本共存
+- 根目录已有视频但同时存在唯一包装子目录：仍会拍平该包装子目录
+- 内容出现等待 10 次后仍为空：停止该整理任务，并按离线 task id 或 BTIH 查询未完成离线/转存任务；若仍在进行则直接取消该任务，同时删除最初创建的空电影目录
+- 其它情况：保守跳过，避免误动复杂目录
+- 剧集目录不参与该整理流程
 
 ## 📅 路线图
 

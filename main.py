@@ -13,7 +13,7 @@ import unicodedata
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime
 from threading import Lock, Thread
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, quote
 
 # ================= Configuration =================
 
@@ -47,12 +47,31 @@ WEBHOOK_PATHS = {"/webhook", "/webhook/radarr", "/radarr/webhook"}
 WEBHOOK_MAX_BODY_BYTES = int(os.getenv("WEBHOOK_MAX_BODY_BYTES", "1048576"))
 PENDING_TASK_FILE = os.getenv("PENDING_TASK_FILE")
 
+# 6. 电影下载完成后的保守型单层包装目录拍平
+MOVIE_FLATTEN_ENABLED = os.getenv("MOVIE_FLATTEN_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+MOVIE_FLATTEN_TASK_FILE = os.getenv("MOVIE_FLATTEN_TASK_FILE")
+MOVIE_FLATTEN_STABLE_CHECKS = int(os.getenv("MOVIE_FLATTEN_STABLE_CHECKS", "2"))
+MOVIE_FLATTEN_MAX_TASKS_PER_LOOP = int(os.getenv("MOVIE_FLATTEN_MAX_TASKS_PER_LOOP", "3"))
+MOVIE_FLATTEN_LIST_PER_PAGE = int(os.getenv("MOVIE_FLATTEN_LIST_PER_PAGE", "1000"))
+MOVIE_CONTENT_POLL_INTERVAL = int(os.getenv("MOVIE_CONTENT_POLL_INTERVAL", "6"))
+MOVIE_CONTENT_MAX_ATTEMPTS = int(os.getenv("MOVIE_CONTENT_MAX_ATTEMPTS", "10"))
+PATH_READY_POLL_INTERVAL = int(os.getenv("PATH_READY_POLL_INTERVAL", "2"))
+PATH_READY_MAX_ATTEMPTS = int(os.getenv("PATH_READY_MAX_ATTEMPTS", "10"))
+
 # =================================================
 
 # 全局变量存储 Token
 CURRENT_TOKEN = ""
 PENDING_TASKS = {}
 PENDING_TASKS_LOCK = Lock()
+MOVIE_FLATTEN_TASKS = {}
+MOVIE_FLATTEN_TASKS_LOCK = Lock()
+
+VIDEO_EXTENSIONS = {
+    ".3gp", ".avi", ".divx", ".flv", ".iso", ".m2ts", ".m4v", ".mkv", ".mov",
+    ".mp4", ".mpeg", ".mpg", ".mts", ".ogm", ".ogv", ".rmvb", ".ts", ".vob",
+    ".webm", ".wmv"
+}
 
 # 配置日志格式 (输出到控制台)
 logging.basicConfig(
@@ -79,6 +98,9 @@ if missing_vars:
 
 if not PENDING_TASK_FILE:
     PENDING_TASK_FILE = os.path.join(PROCESSED_DIR, "radarr_pending_tasks.json")
+
+if not MOVIE_FLATTEN_TASK_FILE:
+    MOVIE_FLATTEN_TASK_FILE = os.path.join(PROCESSED_DIR, "movie_flatten_tasks.json")
 
 def login_and_update_token():
     """
@@ -166,6 +188,37 @@ def alist_post_request(url, payload, retry=True):
         else:
             logger.error("[自动恢复] Token 刷新失败，无法重试，返回原始错误响应。")
             return response
+
+    return response
+
+def alist_get_request(url, retry=True):
+    """通用 GET 请求封装，复用 Token 自动刷新逻辑。"""
+    headers = get_auth_header()
+
+    try:
+        response = requests.get(url, headers=headers)
+    except requests.exceptions.RequestException as e:
+        raise e
+
+    token_expired = False
+    if response.status_code == 401:
+        token_expired = True
+    elif response.status_code == 200:
+        try:
+            data = response.json()
+            code = data.get('code')
+            msg = data.get('message', '').lower()
+            if code != 200 and ("token is expired" in msg or "token 无效" in msg):
+                token_expired = True
+        except ValueError:
+            pass
+
+    if token_expired and retry:
+        logger.warning(f"[自动恢复] 检测到 Token 失效 (HTTP {response.status_code})，正在尝试刷新...")
+        if login_and_update_token():
+            logger.info("[自动恢复] Token 刷新成功，正在重发请求...")
+            return alist_get_request(url, retry=False)
+        logger.error("[自动恢复] Token 刷新失败，无法重试，返回原始错误响应。")
 
     return response
 
@@ -318,6 +371,109 @@ def remove_pending_movie_task(release_key, category_tag):
 
     movie = task.get("movie") or {}
     logger.info(f"{category_tag} [Webhook匹配] 已清理 pending 任务: {movie.get('title')} ({movie.get('year')})")
+
+def save_movie_flatten_tasks_locked():
+    """持久化电影目录拍平任务。调用方需持有 MOVIE_FLATTEN_TASKS_LOCK。"""
+    task_dir = os.path.dirname(MOVIE_FLATTEN_TASK_FILE)
+    if task_dir:
+        os.makedirs(task_dir, exist_ok=True)
+
+    tmp_path = f"{MOVIE_FLATTEN_TASK_FILE}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(MOVIE_FLATTEN_TASKS, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, MOVIE_FLATTEN_TASK_FILE)
+
+def load_movie_flatten_tasks():
+    """启动时加载未完成的电影目录拍平任务。"""
+    global MOVIE_FLATTEN_TASKS
+
+    if not MOVIE_FLATTEN_ENABLED:
+        logger.info("[电影整理] 单层包装目录拍平已关闭")
+        return
+
+    if not os.path.exists(MOVIE_FLATTEN_TASK_FILE):
+        logger.info(f"[电影整理] 任务文件不存在，将在首次写入时创建: {MOVIE_FLATTEN_TASK_FILE}")
+        return
+
+    try:
+        with open(MOVIE_FLATTEN_TASK_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not isinstance(data, dict):
+            logger.warning(f"[电影整理] 任务文件格式异常，已忽略: {MOVIE_FLATTEN_TASK_FILE}")
+            return
+
+        with MOVIE_FLATTEN_TASKS_LOCK:
+            MOVIE_FLATTEN_TASKS = {
+                key: task for key, task in data.items()
+                if isinstance(key, str) and isinstance(task, dict)
+            }
+
+        logger.info(f"[电影整理] 已加载待处理任务: {len(MOVIE_FLATTEN_TASKS)} 个")
+    except Exception as e:
+        logger.error(f"[电影整理] 加载任务失败: {e}")
+
+def register_movie_flatten_task(movie_path, movie_info, category_tag, offline_info=None):
+    """登记电影目录拍平任务，后续主循环等待目录稳定后再整理。"""
+    if not MOVIE_FLATTEN_ENABLED:
+        return
+
+    normalized_path = movie_path.rstrip("/")
+    offline_info = offline_info or {}
+    task = {
+        "path": normalized_path,
+        "movie": movie_info or {},
+        "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "last_checked_at": None,
+        "last_snapshot": None,
+        "stable_count": 0,
+        "content_wait_count": 0,
+        "content_seen_at": None,
+        "cleanup_wrapper_name": None,
+        "offline_task_ids": offline_info.get("task_ids") or [],
+        "btih": offline_info.get("btih")
+    }
+
+    with MOVIE_FLATTEN_TASKS_LOCK:
+        if normalized_path in MOVIE_FLATTEN_TASKS:
+            existing = MOVIE_FLATTEN_TASKS[normalized_path]
+            existing["movie"] = movie_info or existing.get("movie") or {}
+            existing["offline_task_ids"] = offline_info.get("task_ids") or existing.get("offline_task_ids") or []
+            existing["btih"] = offline_info.get("btih") or existing.get("btih")
+            existing["content_wait_count"] = 0
+            existing["content_seen_at"] = None
+            existing["last_snapshot"] = None
+            existing["stable_count"] = 0
+            MOVIE_FLATTEN_TASKS[normalized_path] = existing
+        else:
+            MOVIE_FLATTEN_TASKS[normalized_path] = task
+        save_movie_flatten_tasks_locked()
+
+    logger.info(f"{category_tag} [电影整理] 已登记下载完成后拍平检查: {normalized_path}")
+
+def remove_movie_flatten_task(movie_path, reason):
+    """移除已完成或已判定无需处理的电影目录拍平任务。"""
+    normalized_path = movie_path.rstrip("/")
+
+    with MOVIE_FLATTEN_TASKS_LOCK:
+        if normalized_path not in MOVIE_FLATTEN_TASKS:
+            return
+        MOVIE_FLATTEN_TASKS.pop(normalized_path)
+        save_movie_flatten_tasks_locked()
+
+    logger.info(f"[电影整理] 任务结束: {normalized_path} | {reason}")
+
+def update_movie_flatten_task(movie_path, updates):
+    """更新电影目录拍平任务状态。"""
+    normalized_path = movie_path.rstrip("/")
+
+    with MOVIE_FLATTEN_TASKS_LOCK:
+        task = MOVIE_FLATTEN_TASKS.get(normalized_path)
+        if not task:
+            return
+        task.update(updates)
+        MOVIE_FLATTEN_TASKS[normalized_path] = task
+        save_movie_flatten_tasks_locked()
 
 def get_movie_save_path_from_task(task, cloud_base_path, category_tag):
     """用 Radarr webhook 的 movie.title/year 直接生成电影保存目录。"""
@@ -504,29 +660,64 @@ def get_save_path(filename, cloud_base_path, category_tag):
     logger.warning(f"{category_tag} [路径解析] 未匹配到剧集格式，使用基础路径: {cloud_base_path}")
     return cloud_base_path
 
-def check_alist_path_exists(path):
-    """
-    调用 Alist API 查询路径是否存在 (使用通用请求函数)
-    """
+def alist_get_path_info(path, refresh=True):
+    """调用 OpenList/Alist fs/get 获取路径信息，默认强制刷新缓存。"""
     api_url = f"{ALIST_HOST}/api/fs/get"
-    payload = {"path": path}
+    payload = {
+        "path": path,
+        "password": "",
+        "page": 1,
+        "per_page": 0,
+        "refresh": refresh
+    }
     
     try:
-        # 使用封装的 alist_post_request 替代 requests.post
         response = alist_post_request(api_url, payload)
         
         if response.status_code == 200:
             data = response.json()
-            code = data.get('code')
-            if code == 200:
-                return True
-            else:
-                return False
-        else:
-            logger.error(f"[API Check] HTTP异常 {response.status_code} | Path: {path} | Resp: {response.text}")
-            return False
+            if data.get('code') == 200:
+                return data.get("data") or {}
+            logger.info(f"[API Get] 路径暂不可用: {path} | Resp: {data}")
+            return None
+
+        logger.warning(f"[API Get] HTTP异常 {response.status_code} | Path: {path} | Resp: {response.text}")
+        return None
     except Exception as e:
-        logger.error(f"[API Check] 请求异常: {e}")
+        logger.warning(f"[API Get] 请求异常: {e}")
+    return None
+
+def check_alist_path_exists(path, refresh=True):
+    """
+    调用 OpenList/Alist fs/get 查询路径是否存在。
+    """
+    return alist_get_path_info(path, refresh=refresh) is not None
+
+def wait_for_alist_path_exists(path, parent_path=None, category_tag="[Path]"):
+    """
+    使用 fs/get(refresh=true) 短轮询确认路径存在。
+    必要时用 fs/list(refresh=true) 刷新父目录，超时后保守返回失败。
+    """
+    for attempt in range(1, PATH_READY_MAX_ATTEMPTS + 1):
+        if check_alist_path_exists(path, refresh=True):
+            logger.info(f"{category_tag} [路径确认] 路径已就绪: {path} ({attempt}/{PATH_READY_MAX_ATTEMPTS})")
+            return True
+
+        if parent_path:
+            alist_fs_list(parent_path, refresh=True)
+
+        if attempt < PATH_READY_MAX_ATTEMPTS:
+            logger.info(
+                f"{category_tag} [路径确认] 等待路径刷新: {path} "
+                f"({attempt}/{PATH_READY_MAX_ATTEMPTS})"
+            )
+            time.sleep(PATH_READY_POLL_INTERVAL)
+
+    total_wait = PATH_READY_POLL_INTERVAL * max(PATH_READY_MAX_ATTEMPTS - 1, 0)
+    logger.warning(
+        f"{category_tag} [路径确认] 超时未确认路径: {path} "
+        f"({PATH_READY_MAX_ATTEMPTS} 次，约 {total_wait} 秒)，本轮保守失败"
+    )
     return False
 
 def alist_fs_list(path, refresh=True):
@@ -555,7 +746,250 @@ def alist_fs_list(path, refresh=True):
     except Exception as e:
         logger.warning(f"[API List] 刷新请求失败 {path}: {e}")
 
-def ensure_path_ready(full_path, skip_prefix_path, category_tag, max_wait_seconds=30):
+def alist_list_dir(path, refresh=True):
+    """
+    列出目录内容，供电影整理逻辑判断下载结果是否稳定。
+    """
+    api_url = f"{ALIST_HOST}/api/fs/list"
+    payload = {
+        "path": path,
+        "password": "",
+        "page": 1,
+        "per_page": MOVIE_FLATTEN_LIST_PER_PAGE,
+        "refresh": refresh
+    }
+
+    try:
+        logger.info(f"[API List] 正在读取目录内容: {path}")
+        resp = alist_post_request(api_url, payload)
+
+        if resp.status_code != 200:
+            logger.warning(f"[API List] HTTP 错误: {resp.status_code} | Path: {path} | Body: {resp.text}")
+            return None
+
+        data = resp.json()
+        if data.get("code") != 200:
+            logger.info(f"[API List] 目录暂不可读: {path} | Resp: {data}")
+            return None
+
+        result = data.get("data") or {}
+        content = result.get("content")
+        if content is None:
+            return []
+        if not isinstance(content, list):
+            logger.warning(f"[API List] 返回 content 格式异常: {path} | Content: {content}")
+            return None
+        return content
+    except Exception as e:
+        logger.warning(f"[API List] 读取目录失败 {path}: {e}")
+        return None
+
+def alist_fs_move(src_dir, dst_dir, names, category_tag):
+    """调用 OpenList/Alist move API 移动一组直接子项。"""
+    if not names:
+        return False
+
+    api_url = f"{ALIST_HOST}/api/fs/move"
+    payload = {
+        "src_dir": src_dir,
+        "dst_dir": dst_dir,
+        "names": names
+    }
+
+    try:
+        logger.info(f"{category_tag} [电影整理] 正在移动 {len(names)} 个子项: {src_dir} -> {dst_dir}")
+        resp = alist_post_request(api_url, payload)
+        logger.info(f"{category_tag} [Move API] HTTP: {resp.status_code} | Body: {resp.text}")
+
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("code") == 200
+    except Exception as e:
+        logger.warning(f"{category_tag} [电影整理] 移动失败: {e}")
+
+    return False
+
+def alist_fs_remove(dir_path, names, category_tag):
+    """调用 OpenList/Alist remove API 删除一组直接子项。"""
+    if not names:
+        return False
+
+    api_url = f"{ALIST_HOST}/api/fs/remove"
+    payload = {
+        "dir": dir_path,
+        "names": names
+    }
+
+    try:
+        logger.info(f"{category_tag} [电影整理] 正在删除空目录: {dir_path}/{names[0]}")
+        resp = alist_post_request(api_url, payload)
+        logger.info(f"{category_tag} [Remove API] HTTP: {resp.status_code} | Body: {resp.text}")
+
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("code") == 200
+    except Exception as e:
+        logger.warning(f"{category_tag} [电影整理] 删除失败: {e}")
+
+    return False
+
+def collect_task_ids_from_value(value):
+    """从 add_offline_download 响应中尽量提取任务 id。"""
+    task_ids = []
+
+    def add_task_id(candidate):
+        if candidate is None:
+            return
+        text = str(candidate).strip()
+        if text and text not in task_ids:
+            task_ids.append(text)
+
+    def walk(node, parent_key=""):
+        if isinstance(node, dict):
+            for key, item in node.items():
+                key_text = str(key).lower()
+                if key_text in ("id", "tid", "task_id", "taskid"):
+                    add_task_id(item)
+                else:
+                    walk(item, key_text)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, parent_key)
+        elif parent_key in ("id", "tid", "task_id", "taskid", "task", "tasks", "ids"):
+            add_task_id(node)
+
+    walk(value)
+    if isinstance(value, str):
+        add_task_id(value)
+    elif isinstance(value, list) and all(not isinstance(item, (dict, list)) for item in value):
+        for item in value:
+            add_task_id(item)
+
+    return task_ids
+
+def extract_btih_from_magnet(magnet):
+    """从 magnet 链接提取 BTIH/infohash。"""
+    if not magnet:
+        return None
+
+    match = re.search(r'xt=urn:btih:([A-Za-z0-9]+)', magnet, re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1).lower()
+
+def alist_get_undone_tasks(task_type):
+    """读取 OpenList/Alist 未完成任务列表。"""
+    api_url = f"{ALIST_HOST}/api/task/{task_type}/undone"
+
+    try:
+        resp = alist_get_request(api_url)
+        if resp.status_code != 200:
+            logger.warning(f"[Task API] HTTP 错误: {resp.status_code} | Type: {task_type} | Body: {resp.text}")
+            return None
+
+        data = resp.json()
+        if data.get("code") != 200:
+            logger.warning(f"[Task API] 返回非200: {task_type} | Resp: {data}")
+            return None
+
+        tasks = data.get("data") or []
+        if not isinstance(tasks, list):
+            logger.warning(f"[Task API] data 格式异常: {task_type} | Data: {tasks}")
+            return None
+        return tasks
+    except Exception as e:
+        logger.warning(f"[Task API] 查询未完成任务失败: {task_type} | {e}")
+        return None
+
+def alist_cancel_task(task_type, task_id):
+    """取消 OpenList/Alist 未完成任务。"""
+    if not task_id:
+        return False
+
+    api_url = f"{ALIST_HOST}/api/task/{task_type}/cancel?tid={quote(str(task_id), safe='')}"
+
+    try:
+        resp = alist_post_request(api_url, {})
+        if resp.status_code != 200:
+            logger.warning(f"[Task API] 取消任务 HTTP 错误: {resp.status_code} | Type: {task_type} | ID: {task_id} | Body: {resp.text}")
+            return False
+
+        data = resp.json()
+        if data.get("code") == 200:
+            logger.warning(f"[Task API] 已取消离线任务: type={task_type} id={task_id}")
+            return True
+
+        logger.warning(f"[Task API] 取消任务返回非200: type={task_type} id={task_id} | Resp: {data}")
+    except Exception as e:
+        logger.warning(f"[Task API] 取消任务失败: type={task_type} id={task_id} | {e}")
+
+    return False
+
+def task_contains_btih(task, btih):
+    """在任务字段中查找 BTIH/infohash。"""
+    if not btih:
+        return False
+    task_text = json.dumps(task, ensure_ascii=False).lower()
+    return btih.lower() in task_text
+
+def diagnose_movie_offline_status(movie_path, task):
+    """
+    内容出现等待超时后的诊断:
+    优先按 add_offline_download 返回 task id，其次按 BTIH/infohash 匹配未完成任务。
+    """
+    task_ids = [str(tid) for tid in task.get("offline_task_ids") or [] if tid]
+    btih = task.get("btih")
+    task_types = ("offline_download", "offline_download_transfer")
+
+    all_tasks = []
+    failed_types = []
+    for task_type in task_types:
+        tasks = alist_get_undone_tasks(task_type)
+        if tasks is None:
+            failed_types.append(task_type)
+            continue
+        all_tasks.extend((task_type, undone_task) for undone_task in tasks)
+
+    if failed_types:
+        logger.warning(f"[Movie] [电影整理] 离线任务诊断部分失败: {movie_path} | 类型: {', '.join(failed_types)}")
+
+    if task_ids:
+        for task_type, undone_task in all_tasks:
+            if str(undone_task.get("id")) in task_ids:
+                logger.warning(
+                    f"[Movie] [电影整理] 内容仍为空，但离线仍在进行: {movie_path} | "
+                    f"type={task_type} id={undone_task.get('id')} "
+                    f"state={undone_task.get('state')} progress={undone_task.get('progress')}"
+                )
+                alist_cancel_task(task_type, undone_task.get("id"))
+                return
+
+        logger.warning(
+            f"[Movie] [电影整理] 内容仍为空，离线任务不存在: "
+            f"{movie_path} | task_ids={task_ids}"
+        )
+        return
+
+    if btih:
+        for task_type, undone_task in all_tasks:
+            if task_contains_btih(undone_task, btih):
+                logger.warning(
+                    f"[Movie] [电影整理] 内容仍为空，但离线仍在进行: {movie_path} | "
+                    f"type={task_type} btih={btih} id={undone_task.get('id')} "
+                    f"state={undone_task.get('state')} progress={undone_task.get('progress')}"
+                )
+                alist_cancel_task(task_type, undone_task.get("id"))
+                return
+
+        logger.warning(
+            f"[Movie] [电影整理] 内容仍为空，离线任务不存在: "
+            f"{movie_path} | btih={btih}"
+        )
+        return
+
+    logger.warning(f"[Movie] [电影整理] 内容仍为空，离线任务不存在或缺少可匹配标识: {movie_path}")
+
+def ensure_path_ready(full_path, skip_prefix_path, category_tag):
     """
     逐级创建目录 (智能跳过基础路径版 + 详细Debug日志)
     """
@@ -574,10 +1008,8 @@ def ensure_path_ready(full_path, skip_prefix_path, category_tag, max_wait_second
         if norm_skip_prefix.startswith(current_path):
             continue
 
-        # 2. 检查是否存在
-        exists = check_alist_path_exists(current_path)
-        
-        if exists:
+        # 2. 检查是否存在，fs/get 每次强制刷新，避免依赖缓存 TTL
+        if check_alist_path_exists(current_path, refresh=True):
             continue
         
         # 3. 不存在则创建，增加详细日志
@@ -602,21 +1034,9 @@ def ensure_path_ready(full_path, skip_prefix_path, category_tag, max_wait_second
         except Exception as e:
             logger.warning(f"{category_tag} [Mkdir] 请求异常 (可忽略): {e}")
 
-        # 4. 刷新父目录并等待确认
-        alist_fs_list(parent_path, refresh=True)
-        
-        layer_start_time = time.time()
-        layer_ready = False
-        
-        while time.time() - layer_start_time < max_wait_seconds:
-            if check_alist_path_exists(current_path):
-                layer_ready = True
-                logger.info(f"{category_tag} [Step {i+1}] >> 确认目录就绪: {current_path}")
-                break
-            time.sleep(2)
-            
-        if not layer_ready:
-            logger.error(f"{category_tag} [Timeout] 致命错误: 目录创建后无法在云端确认: {current_path}")
+        # 4. 短轮询确认路径。本轮超时则保守失败，留给下一轮主循环重试。
+        if not wait_for_alist_path_exists(current_path, parent_path=parent_path, category_tag=category_tag):
+            logger.warning(f"{category_tag} [任务延后] 目录创建后暂未确认，下一轮重试: {current_path}")
             return False
 
     logger.info(f"{category_tag} ------ 云端路径校验全部通过 ------")
@@ -649,8 +1069,16 @@ def add_offline_download(url, save_path, cloud_base_path, category_tag):
         if response.status_code == 200:
             resp_json = response.json()
             if resp_json.get('code') == 200:
+                task_ids = collect_task_ids_from_value(resp_json.get("data"))
+                btih = extract_btih_from_magnet(url)
                 logger.info(f"{category_tag} [离线下载] ✅ 任务添加成功! 目标: {save_path}")
-                return True
+                if task_ids:
+                    logger.info(f"{category_tag} [离线下载] 任务 ID: {', '.join(task_ids)}")
+                return {
+                    "ok": True,
+                    "task_ids": task_ids,
+                    "btih": btih
+                }
             else:
                 logger.error(f"{category_tag} [离线下载] ❌ Alist 返回错误: {resp_json.get('message')}")
         else:
@@ -658,6 +1086,223 @@ def add_offline_download(url, save_path, cloud_base_path, category_tag):
     except Exception as e:
         logger.error(f"{category_tag} [离线下载] 连接异常: {e}")
     return False
+
+def join_cloud_path(parent, child):
+    """拼接云端路径。"""
+    return f"{parent.rstrip('/')}/{child}"
+
+def is_dir_entry(entry):
+    """兼容 OpenList/Alist 目录字段。"""
+    return bool(entry.get("is_dir") or entry.get("isDir"))
+
+def get_entry_name(entry):
+    """读取目录项名称。"""
+    name = entry.get("name")
+    if name is None:
+        return ""
+    return str(name)
+
+def is_video_entry(entry):
+    """判断目录项是否是常见视频文件。"""
+    if is_dir_entry(entry):
+        return False
+    _, ext = os.path.splitext(get_entry_name(entry).lower())
+    return ext in VIDEO_EXTENSIONS
+
+def build_dir_snapshot(entries):
+    """生成稳定性判断用的单层目录快照。"""
+    snapshot = []
+    for entry in entries:
+        name = get_entry_name(entry)
+        if not name:
+            continue
+        snapshot.append({
+            "name": name,
+            "is_dir": is_dir_entry(entry),
+            "size": entry.get("size"),
+            "modified": entry.get("modified")
+        })
+    return sorted(snapshot, key=lambda item: (not item["is_dir"], item["name"]))
+
+def cleanup_empty_wrapper_dir(movie_path, wrapper_name, category_tag):
+    """删除拍平后留下的空包装目录。"""
+    wrapper_path = join_cloud_path(movie_path, wrapper_name)
+    entries = alist_list_dir(wrapper_path, refresh=True)
+    if entries is None:
+        logger.info(f"{category_tag} [电影整理] 包装目录暂不可读，稍后重试删除: {wrapper_path}")
+        return False
+
+    if entries:
+        logger.warning(f"{category_tag} [电影整理] 包装目录仍非空，暂不删除: {wrapper_path}")
+        return False
+
+    if alist_fs_remove(movie_path, [wrapper_name], category_tag):
+        logger.info(f"{category_tag} [电影整理] 已删除空包装目录: {wrapper_path}")
+        return True
+
+    return False
+
+def cleanup_empty_movie_dir(movie_path, category_tag):
+    """内容等待超时后，保守删除最初创建的空电影目录。"""
+    normalized_path = movie_path.rstrip("/")
+    parent_path, movie_folder = normalized_path.rsplit("/", 1)
+    if not parent_path:
+        parent_path = "/"
+
+    entries = alist_list_dir(normalized_path, refresh=True)
+    if entries is None:
+        logger.warning(f"{category_tag} [电影整理] 电影目录暂不可读，跳过删除: {normalized_path}")
+        return False
+
+    if entries:
+        logger.warning(f"{category_tag} [电影整理] 电影目录非空，跳过删除: {normalized_path}")
+        return False
+
+    if alist_fs_remove(parent_path, [movie_folder], category_tag):
+        logger.warning(f"{category_tag} [电影整理] 已删除空电影目录: {normalized_path}")
+        return True
+
+    return False
+
+def wait_for_movie_content(movie_path, task, category_tag):
+    """第一阶段: 等待电影根目录出现内容，空目录不参与稳定计数。"""
+    content_wait_count = int(task.get("content_wait_count") or 0)
+
+    while content_wait_count < MOVIE_CONTENT_MAX_ATTEMPTS:
+        entries = alist_list_dir(movie_path, refresh=True)
+        content_wait_count += 1
+        update_movie_flatten_task(movie_path, {
+            "last_checked_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "content_wait_count": content_wait_count
+        })
+
+        if entries:
+            logger.info(
+                f"{category_tag} [电影整理] 已检测到目录内容，进入稳定判定: "
+                f"{movie_path} ({content_wait_count}/{MOVIE_CONTENT_MAX_ATTEMPTS})"
+            )
+            update_movie_flatten_task(movie_path, {
+                "content_seen_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                "last_snapshot": None,
+                "stable_count": 0
+            })
+            return entries
+
+        if entries is None:
+            logger.info(
+                f"{category_tag} [电影整理] 目标目录暂不可读，等待内容出现: "
+                f"{movie_path} ({content_wait_count}/{MOVIE_CONTENT_MAX_ATTEMPTS})"
+            )
+        else:
+            logger.info(
+                f"{category_tag} [电影整理] 目标目录仍为空，等待内容出现: "
+                f"{movie_path} ({content_wait_count}/{MOVIE_CONTENT_MAX_ATTEMPTS})"
+            )
+
+        if content_wait_count < MOVIE_CONTENT_MAX_ATTEMPTS:
+            time.sleep(MOVIE_CONTENT_POLL_INTERVAL)
+
+    diagnose_movie_offline_status(movie_path, task)
+    cleanup_empty_movie_dir(movie_path, category_tag)
+    remove_movie_flatten_task(movie_path, "内容出现等待超时，已记录离线任务诊断")
+    return None
+
+def flatten_movie_wrapper_once(movie_path, task):
+    """
+    对单个电影规范目录执行一次保守型单层拍平检查。
+    仅当可明确识别唯一包装子目录时才移动，兼容根目录已有其它版本视频。
+    """
+    category_tag = "[Movie]"
+    movie_path = movie_path.rstrip("/")
+
+    cleanup_wrapper_name = task.get("cleanup_wrapper_name")
+    if cleanup_wrapper_name:
+        if cleanup_empty_wrapper_dir(movie_path, cleanup_wrapper_name, category_tag):
+            remove_movie_flatten_task(movie_path, f"已清理空包装目录 {cleanup_wrapper_name}")
+        return
+
+    if not task.get("content_seen_at"):
+        entries = wait_for_movie_content(movie_path, task, category_tag)
+        if entries is None:
+            return
+    else:
+        entries = alist_list_dir(movie_path, refresh=True)
+        if entries is None:
+            logger.info(f"{category_tag} [电影整理] 目标目录暂不可读，等待下载完成: {movie_path}")
+            return
+        if not entries:
+            logger.info(f"{category_tag} [电影整理] 内容曾出现但当前为空，稍后重试: {movie_path}")
+            return
+
+    snapshot = build_dir_snapshot(entries)
+    last_snapshot = task.get("last_snapshot")
+    stable_count = int(task.get("stable_count") or 0)
+    if snapshot == last_snapshot:
+        stable_count += 1
+    else:
+        stable_count = 1
+
+    update_movie_flatten_task(movie_path, {
+        "last_checked_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "last_snapshot": snapshot,
+        "stable_count": stable_count
+    })
+
+    if stable_count < MOVIE_FLATTEN_STABLE_CHECKS:
+        logger.info(
+            f"{category_tag} [电影整理] 等待目录稳定: {movie_path} "
+            f"({stable_count}/{MOVIE_FLATTEN_STABLE_CHECKS})"
+        )
+        return
+
+    dir_entries = [entry for entry in entries if is_dir_entry(entry)]
+
+    if not dir_entries:
+        remove_movie_flatten_task(movie_path, "内容已出现但无包装目录，结束拍平任务")
+        return
+
+    if len(dir_entries) != 1:
+        remove_movie_flatten_task(movie_path, "存在多个目录子项，无法确定新增包装目录，保守跳过")
+        return
+
+    wrapper_name = get_entry_name(dir_entries[0])
+    if not wrapper_name:
+        remove_movie_flatten_task(movie_path, "包装目录名称为空，保守跳过")
+        return
+
+    wrapper_path = join_cloud_path(movie_path, wrapper_name)
+    child_entries = alist_list_dir(wrapper_path, refresh=True)
+    if child_entries is None:
+        logger.info(f"{category_tag} [电影整理] 包装目录暂不可读，稍后重试: {wrapper_path}")
+        return
+
+    child_names = [get_entry_name(entry) for entry in child_entries if get_entry_name(entry)]
+    if not child_names:
+        remove_movie_flatten_task(movie_path, "包装目录为空，保守跳过")
+        return
+
+    if not alist_fs_move(wrapper_path, movie_path, child_names, category_tag):
+        logger.warning(f"{category_tag} [电影整理] 包装目录内容移动失败，稍后重试: {wrapper_path}")
+        return
+
+    update_movie_flatten_task(movie_path, {"cleanup_wrapper_name": wrapper_name})
+    if cleanup_empty_wrapper_dir(movie_path, wrapper_name, category_tag):
+        remove_movie_flatten_task(movie_path, f"已拍平单层包装目录 {wrapper_name}")
+
+def process_movie_flatten_tasks():
+    """处理少量电影拍平任务，避免影响主循环性能。"""
+    if not MOVIE_FLATTEN_ENABLED:
+        return
+
+    with MOVIE_FLATTEN_TASKS_LOCK:
+        tasks = list(MOVIE_FLATTEN_TASKS.items())[:MOVIE_FLATTEN_MAX_TASKS_PER_LOOP]
+
+    for movie_path, task in tasks:
+        try:
+            flatten_movie_wrapper_once(movie_path, task)
+        except Exception as e:
+            logger.error(f"[Movie] [电影整理] 未捕获异常: {movie_path} | {e}")
+            logger.error(traceback.format_exc())
 
 def process_single_dir(watch_dir, cloud_base_path, category_name):
     """
@@ -722,6 +1367,12 @@ def process_single_dir(watch_dir, cloud_base_path, category_name):
         if success:
             if pending_movie_task:
                 remove_pending_movie_task(pending_release_key, category_tag)
+                register_movie_flatten_task(
+                    target_path,
+                    pending_movie_task.get("movie"),
+                    category_tag,
+                    success
+                )
 
             try:
                 # 归档逻辑
@@ -749,6 +1400,7 @@ def main():
     logger.info(f"归档总目录: {PROCESSED_DIR}")
     logger.info(f"Alist Host: {ALIST_HOST}")
     load_pending_tasks()
+    load_movie_flatten_tasks()
     webhook_server = start_webhook_server()
     
     # 打印监控配置
@@ -767,6 +1419,7 @@ def main():
                     cloud_base_path=config['cloud'],
                     category_name=category
                 )
+            process_movie_flatten_tasks()
         except KeyboardInterrupt:
             logger.info("用户停止脚本")
             if webhook_server:
