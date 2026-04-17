@@ -15,6 +15,9 @@ COPY main.py .
 COPY config.py .
 COPY state.py .
 COPY alist_client.py .
+COPY clouddrive_client.py .
+COPY clouddrive_pb2.py .
+COPY clouddrive_pb2_grpc.py .
 COPY path_utils.py .
 COPY webhook.py .
 COPY movie_flatten.py .

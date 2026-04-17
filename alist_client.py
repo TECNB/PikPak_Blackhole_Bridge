@@ -6,6 +6,11 @@ from urllib.parse import quote
 import requests
 
 import state
+from clouddrive_client import (
+    build_cd2_authorized_metadata,
+    clouddrive_find_file_by_path,
+    clouddrive_list_sub_files,
+)
 from config import (
     ALIST_HOST,
     ALIST_PATH_MOVIE,
@@ -58,11 +63,6 @@ def get_auth_header():
     if not state.CURRENT_TOKEN:
         login_and_update_token()
     return {"Authorization": state.CURRENT_TOKEN, "Content-Type": "application/json"}
-
-
-def get_static_auth_header(token):
-    """获取固定 Token 的 Header。"""
-    return {"Authorization": token, "Content-Type": "application/json"}
 
 
 def alist_post_request(url, payload, retry=True):
@@ -133,12 +133,6 @@ def alist_get_request(url, retry=True):
     return response
 
 
-def static_post_request(url, payload, token):
-    """固定 Token 的通用 POST 请求封装。"""
-    headers = get_static_auth_header(token)
-    return requests.post(url, json=payload, headers=headers, timeout=20)
-
-
 def alist_get_path_info(path, refresh=True):
     """调用 OpenList/Alist fs/get 获取路径信息，默认强制刷新缓存。"""
     api_url = f"{ALIST_HOST}/api/fs/get"
@@ -164,34 +158,6 @@ def alist_get_path_info(path, refresh=True):
         return None
     except Exception as e:
         logger.warning(f"[API Get] 请求异常: {e}")
-    return None
-
-
-def cd2_get_path_info(path, refresh=True):
-    """调用 CD2 的 fs/get 获取路径信息。"""
-    api_url = f"{CD2_HOST}/api/fs/get"
-    payload = {
-        "path": path,
-        "password": "",
-        "page": 1,
-        "per_page": 0,
-        "refresh": refresh,
-    }
-
-    try:
-        response = static_post_request(api_url, payload, CD2_TOKEN)
-
-        if response.status_code == 200:
-            data = response.json()
-            if data.get("code") == 200:
-                return data.get("data") or {}
-            logger.info(f"[CD2 Get] 路径暂不可用: {path} | Resp: {data}")
-            return None
-
-        logger.warning(f"[CD2 Get] HTTP异常 {response.status_code} | Path: {path} | Resp: {response.text}")
-        return None
-    except Exception as e:
-        logger.warning(f"[CD2 Get] 请求异常: {e}")
     return None
 
 
@@ -230,43 +196,6 @@ def wait_for_alist_path_exists(path, parent_path=None, category_tag="[Path]"):
     return False
 
 
-def cd2_list_dir(path, refresh=True, per_page=1):
-    """列出 CD2 目录内容，并可借此触发 refresh。"""
-    api_url = f"{CD2_HOST}/api/fs/list"
-    payload = {
-        "path": path,
-        "password": "",
-        "page": 1,
-        "per_page": per_page,
-        "refresh": refresh,
-    }
-
-    try:
-        logger.info(f"[CD2 List] 正在读取目录内容: {path}")
-        resp = static_post_request(api_url, payload, CD2_TOKEN)
-
-        if resp.status_code != 200:
-            logger.warning(f"[CD2 List] HTTP 错误: {resp.status_code} | Path: {path} | Body: {resp.text}")
-            return None
-
-        data = resp.json()
-        if data.get("code") != 200:
-            logger.info(f"[CD2 List] 目录暂不可读: {path} | Resp: {data}")
-            return None
-
-        result = data.get("data") or {}
-        content = result.get("content")
-        if content is None:
-            return []
-        if not isinstance(content, list):
-            logger.warning(f"[CD2 List] 返回 content 格式异常: {path} | Content: {content}")
-            return None
-        return content
-    except Exception as e:
-        logger.warning(f"[CD2 List] 读取目录失败 {path}: {e}")
-        return None
-
-
 def confirm_cd2_movie_path_ready(movie_path, category_tag):
     """
     可选的 CD2 刷新确认:
@@ -303,17 +232,27 @@ def confirm_cd2_movie_path_ready(movie_path, category_tag):
             f"{category_tag} [CD2刷新] 路径映射: {normalized_path} -> {cd2_movie_path}"
         )
 
-    if "/" in cd2_movie_path:
-        parent_path, _ = cd2_movie_path.rsplit("/", 1)
-        if not parent_path:
-            parent_path = "/"
+    grpc_target_path = cd2_movie_path.rstrip("/") or "/"
+    if "/" in grpc_target_path:
+        grpc_parent_path, _ = grpc_target_path.rsplit("/", 1)
+        if not grpc_parent_path:
+            grpc_parent_path = "/"
     else:
-        parent_path = "/"
+        grpc_parent_path = "/"
+
+    auth_metadata = build_cd2_authorized_metadata()
+    if not auth_metadata:
+        logger.warning(f"{category_tag} [CD2刷新] 无法构造 CD2 认证信息，跳过确认: {cd2_movie_path}")
+        return False
 
     for attempt in range(1, CD2_REFRESH_MAX_ATTEMPTS + 1):
-        cd2_list_dir(parent_path, refresh=True, per_page=1)
-        path_info = cd2_get_path_info(cd2_movie_path, refresh=True)
-        entries = cd2_list_dir(cd2_movie_path, refresh=True, per_page=MOVIE_FLATTEN_LIST_PER_PAGE)
+        logger.info(f"[CD2 List] 正在读取目录内容: {grpc_parent_path}")
+        clouddrive_list_sub_files(grpc_parent_path, auth_metadata, force_refresh=True)
+
+        path_info = clouddrive_find_file_by_path(grpc_parent_path, grpc_target_path, auth_metadata)
+
+        logger.info(f"[CD2 List] 正在读取目录内容: {grpc_target_path}")
+        entries = clouddrive_list_sub_files(grpc_target_path, auth_metadata, force_refresh=True)
 
         if path_info is not None and entries is not None:
             logger.info(

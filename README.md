@@ -165,8 +165,9 @@ Radarr 的 Torrent Blackhole Grab Webhook 不会提供磁力本体，但会提�
 
 - 根目录存在唯一包装子目录：将该子目录内容移动到电影根目录，再删除空子目录，兼容 4K/1080p 等多版本共存
 - 根目录已有视频但同时存在唯一包装子目录：仍会拍平该包装子目录
-- 若启用 `CD2_REFRESH_ENABLED=true`：仅会在“已拍平完成”或“确认根目录本就没有包装目录”之后，再对拍平后的最终 `movie_path` 执行一次 CD2 父目录刷新，并按 10 秒间隔最多轮询 5 次，用 `fs/get + fs/list` 确认 CD2 已看到该目录
+- 若启用 `CD2_REFRESH_ENABLED=true`：仅会在“已拍平完成”或“确认根目录本就没有包装目录”之后，再对拍平后的最终 `movie_path` 执行一次 CD2 父目录刷新，并按 10 秒间隔最多轮询 5 次，用 CloudDrive2 的 `GetSubFiles + FindFileByPath` 确认 CD2 已看到该目录
 - 若 CD2 的实际电影根目录与 OpenList 不同，可设置 `CD2_MOVIE_BASE_PATH`；例如 OpenList 为 `/pikpak/Media/Movie`，CD2 为 `/WebDAV/Media/Movie` 时，程序会自动把最终电影路径映射后再去 CD2 确认
+- CD2 侧基于 CloudDrive2 官方 gRPC API 查询；默认直接按 `CD2_MOVIE_BASE_PATH` 映射后的路径访问，因此请让 token 的 `RootDirectoryRequired` 与该路径保持一致
 - 内容出现等待 10 次后仍为空：停止该整理任务，并按离线 task id 或 BTIH 查询未完成离线/转存任务；若仍在进行则直接取消该任务，同时删除最初创建的空电影目录
 - 其它情况：保守跳过，避免误动复杂目录
 - 剧集目录不参与该整理流程
