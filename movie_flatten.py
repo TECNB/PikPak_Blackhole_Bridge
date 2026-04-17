@@ -9,6 +9,7 @@ from alist_client import (
     alist_fs_remove,
     alist_get_undone_tasks,
     alist_list_dir,
+    confirm_cd2_movie_path_ready,
     task_contains_btih,
 )
 from config import (
@@ -127,6 +128,13 @@ def remove_movie_flatten_task(movie_path, reason):
         save_movie_flatten_tasks_locked()
 
     logger.info(f"[电影整理] 任务结束: {normalized_path} | {reason}")
+
+
+def finalize_movie_flatten_task(movie_path, reason, category_tag, confirm_cd2=False):
+    """统一处理正常收尾，可选执行 CD2 刷新确认。"""
+    if confirm_cd2:
+        confirm_cd2_movie_path_ready(movie_path, category_tag)
+    remove_movie_flatten_task(movie_path, reason)
 
 
 def update_movie_flatten_task(movie_path, updates):
@@ -320,7 +328,12 @@ def flatten_movie_wrapper_once(movie_path, task):
     cleanup_wrapper_name = task.get("cleanup_wrapper_name")
     if cleanup_wrapper_name:
         if cleanup_empty_wrapper_dir(movie_path, cleanup_wrapper_name, category_tag):
-            remove_movie_flatten_task(movie_path, f"已清理空包装目录 {cleanup_wrapper_name}")
+            finalize_movie_flatten_task(
+                movie_path,
+                f"已清理空包装目录 {cleanup_wrapper_name}",
+                category_tag,
+                confirm_cd2=True,
+            )
         return
 
     if not task.get("content_seen_at"):
@@ -363,7 +376,12 @@ def flatten_movie_wrapper_once(movie_path, task):
     dir_entries = [entry for entry in entries if is_dir_entry(entry)]
 
     if not dir_entries:
-        remove_movie_flatten_task(movie_path, "内容已出现但无包装目录，结束拍平任务")
+        finalize_movie_flatten_task(
+            movie_path,
+            "内容已出现但无包装目录，结束拍平任务",
+            category_tag,
+            confirm_cd2=True,
+        )
         return
 
     if len(dir_entries) != 1:
@@ -392,7 +410,12 @@ def flatten_movie_wrapper_once(movie_path, task):
 
     update_movie_flatten_task(movie_path, {"cleanup_wrapper_name": wrapper_name})
     if cleanup_empty_wrapper_dir(movie_path, wrapper_name, category_tag):
-        remove_movie_flatten_task(movie_path, f"已拍平单层包装目录 {wrapper_name}")
+        finalize_movie_flatten_task(
+            movie_path,
+            f"已拍平单层包装目录 {wrapper_name}",
+            category_tag,
+            confirm_cd2=True,
+        )
 
 
 def process_movie_flatten_tasks():

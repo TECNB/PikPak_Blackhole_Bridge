@@ -44,6 +44,13 @@ MOVIE_CONTENT_MAX_ATTEMPTS = int(os.getenv("MOVIE_CONTENT_MAX_ATTEMPTS", "10"))
 PATH_READY_POLL_INTERVAL = int(os.getenv("PATH_READY_POLL_INTERVAL", "2"))
 PATH_READY_MAX_ATTEMPTS = int(os.getenv("PATH_READY_MAX_ATTEMPTS", "10"))
 
+# 7. 可选的 CD2 目录刷新确认
+CD2_REFRESH_ENABLED = os.getenv("CD2_REFRESH_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+CD2_HOST = os.getenv("CD2_HOST", "").rstrip("/")
+CD2_TOKEN = os.getenv("CD2_TOKEN", "").strip()
+CD2_REFRESH_POLL_INTERVAL = int(os.getenv("CD2_REFRESH_POLL_INTERVAL", "10"))
+CD2_REFRESH_MAX_ATTEMPTS = int(os.getenv("CD2_REFRESH_MAX_ATTEMPTS", "5"))
+
 VIDEO_EXTENSIONS = {
     ".3gp",
     ".avi",

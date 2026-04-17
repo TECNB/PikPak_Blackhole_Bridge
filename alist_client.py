@@ -10,6 +10,11 @@ from config import (
     ALIST_HOST,
     ALIST_PASSWORD,
     ALIST_USERNAME,
+    CD2_HOST,
+    CD2_REFRESH_ENABLED,
+    CD2_REFRESH_MAX_ATTEMPTS,
+    CD2_REFRESH_POLL_INTERVAL,
+    CD2_TOKEN,
     MOVIE_FLATTEN_LIST_PER_PAGE,
     PATH_READY_MAX_ATTEMPTS,
     PATH_READY_POLL_INTERVAL,
@@ -51,6 +56,11 @@ def get_auth_header():
     if not state.CURRENT_TOKEN:
         login_and_update_token()
     return {"Authorization": state.CURRENT_TOKEN, "Content-Type": "application/json"}
+
+
+def get_static_auth_header(token):
+    """获取固定 Token 的 Header。"""
+    return {"Authorization": token, "Content-Type": "application/json"}
 
 
 def alist_post_request(url, payload, retry=True):
@@ -121,6 +131,12 @@ def alist_get_request(url, retry=True):
     return response
 
 
+def static_post_request(url, payload, token):
+    """固定 Token 的通用 POST 请求封装。"""
+    headers = get_static_auth_header(token)
+    return requests.post(url, json=payload, headers=headers, timeout=20)
+
+
 def alist_get_path_info(path, refresh=True):
     """调用 OpenList/Alist fs/get 获取路径信息，默认强制刷新缓存。"""
     api_url = f"{ALIST_HOST}/api/fs/get"
@@ -146,6 +162,34 @@ def alist_get_path_info(path, refresh=True):
         return None
     except Exception as e:
         logger.warning(f"[API Get] 请求异常: {e}")
+    return None
+
+
+def cd2_get_path_info(path, refresh=True):
+    """调用 CD2 的 fs/get 获取路径信息。"""
+    api_url = f"{CD2_HOST}/api/fs/get"
+    payload = {
+        "path": path,
+        "password": "",
+        "page": 1,
+        "per_page": 0,
+        "refresh": refresh,
+    }
+
+    try:
+        response = static_post_request(api_url, payload, CD2_TOKEN)
+
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("code") == 200:
+                return data.get("data") or {}
+            logger.info(f"[CD2 Get] 路径暂不可用: {path} | Resp: {data}")
+            return None
+
+        logger.warning(f"[CD2 Get] HTTP异常 {response.status_code} | Path: {path} | Resp: {response.text}")
+        return None
+    except Exception as e:
+        logger.warning(f"[CD2 Get] 请求异常: {e}")
     return None
 
 
@@ -180,6 +224,94 @@ def wait_for_alist_path_exists(path, parent_path=None, category_tag="[Path]"):
     logger.warning(
         f"{category_tag} [路径确认] 超时未确认路径: {path} "
         f"({PATH_READY_MAX_ATTEMPTS} 次，约 {total_wait} 秒)，本轮保守失败"
+    )
+    return False
+
+
+def cd2_list_dir(path, refresh=True, per_page=1):
+    """列出 CD2 目录内容，并可借此触发 refresh。"""
+    api_url = f"{CD2_HOST}/api/fs/list"
+    payload = {
+        "path": path,
+        "password": "",
+        "page": 1,
+        "per_page": per_page,
+        "refresh": refresh,
+    }
+
+    try:
+        logger.info(f"[CD2 List] 正在读取目录内容: {path}")
+        resp = static_post_request(api_url, payload, CD2_TOKEN)
+
+        if resp.status_code != 200:
+            logger.warning(f"[CD2 List] HTTP 错误: {resp.status_code} | Path: {path} | Body: {resp.text}")
+            return None
+
+        data = resp.json()
+        if data.get("code") != 200:
+            logger.info(f"[CD2 List] 目录暂不可读: {path} | Resp: {data}")
+            return None
+
+        result = data.get("data") or {}
+        content = result.get("content")
+        if content is None:
+            return []
+        if not isinstance(content, list):
+            logger.warning(f"[CD2 List] 返回 content 格式异常: {path} | Content: {content}")
+            return None
+        return content
+    except Exception as e:
+        logger.warning(f"[CD2 List] 读取目录失败 {path}: {e}")
+        return None
+
+
+def confirm_cd2_movie_path_ready(movie_path, category_tag):
+    """
+    可选的 CD2 刷新确认:
+    拍平完成或确认无需拍平后，刷新父目录并短轮询确认最终影片目录已可见。
+    """
+    if not CD2_REFRESH_ENABLED:
+        return None
+
+    if not CD2_HOST or not CD2_TOKEN:
+        logger.warning(f"{category_tag} [CD2刷新] 已启用但缺少 CD2_HOST/CD2_TOKEN，跳过确认: {movie_path}")
+        return False
+
+    normalized_path = movie_path.rstrip("/")
+    if not normalized_path:
+        logger.warning(f"{category_tag} [CD2刷新] 影片路径为空，跳过确认")
+        return False
+
+    if "/" in normalized_path:
+        parent_path, _ = normalized_path.rsplit("/", 1)
+        if not parent_path:
+            parent_path = "/"
+    else:
+        parent_path = "/"
+
+    for attempt in range(1, CD2_REFRESH_MAX_ATTEMPTS + 1):
+        cd2_list_dir(parent_path, refresh=True, per_page=1)
+        path_info = cd2_get_path_info(normalized_path, refresh=True)
+        entries = cd2_list_dir(normalized_path, refresh=True, per_page=MOVIE_FLATTEN_LIST_PER_PAGE)
+
+        if path_info is not None and entries is not None:
+            logger.info(
+                f"{category_tag} [CD2刷新] CD2 已刷新并看到最终影片目录: "
+                f"{normalized_path} | 子项 {len(entries)} 个 "
+                f"({attempt}/{CD2_REFRESH_MAX_ATTEMPTS})"
+            )
+            return True
+
+        if attempt < CD2_REFRESH_MAX_ATTEMPTS:
+            logger.info(
+                f"{category_tag} [CD2刷新] CD2 暂未看到最终影片目录，等待重试: "
+                f"{normalized_path} ({attempt}/{CD2_REFRESH_MAX_ATTEMPTS})"
+            )
+            time.sleep(CD2_REFRESH_POLL_INTERVAL)
+
+    logger.warning(
+        f"{category_tag} [CD2刷新] CD2 未找到影片目录: "
+        f"{normalized_path} ({CD2_REFRESH_MAX_ATTEMPTS} 次)"
     )
     return False
 
