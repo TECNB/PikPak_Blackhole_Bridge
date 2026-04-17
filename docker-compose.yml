@@ -1,5 +1,3 @@
-version: '3'
-
 services:
   pikpak-bot:
     build: .

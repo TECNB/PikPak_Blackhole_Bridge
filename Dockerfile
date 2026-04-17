@@ -12,5 +12,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制脚本
 COPY main.py .
+COPY config.py .
+COPY state.py .
+COPY alist_client.py .
+COPY path_utils.py .
+COPY webhook.py .
+COPY movie_flatten.py .
+COPY processor.py .
 
 CMD ["python", "main.py"]
