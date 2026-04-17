@@ -1,0 +1,8 @@
+from threading import Lock
+
+
+CURRENT_TOKEN = ""
+PENDING_TASKS = {}
+PENDING_TASKS_LOCK = Lock()
+MOVIE_FLATTEN_TASKS = {}
+MOVIE_FLATTEN_TASKS_LOCK = Lock()
