@@ -22,5 +22,6 @@ COPY path_utils.py .
 COPY webhook.py .
 COPY movie_flatten.py .
 COPY processor.py .
+COPY radarr_client.py .
 
 CMD ["python", "main.py"]

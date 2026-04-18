@@ -28,6 +28,7 @@ from path_utils import (
     join_cloud_path,
     sanitize_path_component,
 )
+from radarr_client import trigger_radarr_movie_refresh
 
 import json
 import os
@@ -130,10 +131,11 @@ def remove_movie_flatten_task(movie_path, reason):
     logger.info(f"[电影整理] 任务结束: {normalized_path} | {reason}")
 
 
-def finalize_movie_flatten_task(movie_path, reason, category_tag, confirm_cd2=False):
+def finalize_movie_flatten_task(movie_path, reason, category_tag, task=None, confirm_cd2=False):
     """统一处理正常收尾，可选执行 CD2 刷新确认。"""
     if confirm_cd2:
         confirm_cd2_movie_path_ready(movie_path, category_tag)
+    trigger_radarr_movie_refresh((task or {}).get("movie"), movie_path)
     remove_movie_flatten_task(movie_path, reason)
 
 
@@ -332,6 +334,7 @@ def flatten_movie_wrapper_once(movie_path, task):
                 movie_path,
                 f"已清理空包装目录 {cleanup_wrapper_name}",
                 category_tag,
+                task=task,
                 confirm_cd2=True,
             )
         return
@@ -380,6 +383,7 @@ def flatten_movie_wrapper_once(movie_path, task):
             movie_path,
             "内容已出现但无包装目录，结束拍平任务",
             category_tag,
+            task=task,
             confirm_cd2=True,
         )
         return
@@ -414,6 +418,7 @@ def flatten_movie_wrapper_once(movie_path, task):
             movie_path,
             f"已拍平单层包装目录 {wrapper_name}",
             category_tag,
+            task=task,
             confirm_cd2=True,
         )
 

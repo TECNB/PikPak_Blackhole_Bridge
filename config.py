@@ -56,6 +56,10 @@ CD2_MOVIE_BASE_PATH = os.getenv("CD2_MOVIE_BASE_PATH", "").rstrip("/")
 CD2_REFRESH_POLL_INTERVAL = int(os.getenv("CD2_REFRESH_POLL_INTERVAL", "10"))
 CD2_REFRESH_MAX_ATTEMPTS = int(os.getenv("CD2_REFRESH_MAX_ATTEMPTS", "5"))
 
+# 9. 可选的 Radarr 定向刷新/扫描
+RADARR_HOST = os.getenv("RADARR_HOST", "").rstrip("/")
+RADARR_API_KEY = os.getenv("RADARR_API_KEY", "").strip()
+
 VIDEO_EXTENSIONS = {
     ".3gp",
     ".avi",
