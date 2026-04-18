@@ -59,6 +59,14 @@ CD2_REFRESH_MAX_ATTEMPTS = int(os.getenv("CD2_REFRESH_MAX_ATTEMPTS", "5"))
 # 9. 可选的 Radarr 定向刷新/扫描
 RADARR_HOST = os.getenv("RADARR_HOST", "").rstrip("/")
 RADARR_API_KEY = os.getenv("RADARR_API_KEY", "").strip()
+RADARR_REFRESH_CONFIRM_ENABLED = os.getenv("RADARR_REFRESH_CONFIRM_ENABLED", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+RADARR_REFRESH_CONFIRM_POLL_INTERVAL = int(os.getenv("RADARR_REFRESH_CONFIRM_POLL_INTERVAL", "2"))
+RADARR_REFRESH_CONFIRM_MAX_ATTEMPTS = int(os.getenv("RADARR_REFRESH_CONFIRM_MAX_ATTEMPTS", "5"))
 
 VIDEO_EXTENSIONS = {
     ".3gp",
