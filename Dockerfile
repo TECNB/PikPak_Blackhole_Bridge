@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 COPY config.py .
 COPY state.py .
+COPY autosymlink_client.py .
 COPY alist_client.py .
 COPY clouddrive_client.py .
 COPY clouddrive_pb2.py .

@@ -145,6 +145,16 @@ RADARR_API_KEY=your_radarr_api_key_here
 RADARR_REFRESH_CONFIRM_ENABLED=true
 RADARR_REFRESH_CONFIRM_POLL_INTERVAL=2
 RADARR_REFRESH_CONFIRM_MAX_ATTEMPTS=5
+
+# 可选: ani-rss 下载完成后触发 Auto_Symlink 手动刷新
+AUTOSYMLINK_BASE_URL=http://your-autosymlink-host:8095
+AUTOSYMLINK_API_KEY=your_autosymlink_api_key_here
+AUTOSYMLINK_TASK_UUID=your_autosymlink_task_uuid_here
+AUTOSYMLINK_NORMAL_DELAY_SECONDS=75
+AUTOSYMLINK_RETRY_COUNT=2
+AUTOSYMLINK_RETRY_DELAY_SECONDS=30
+AUTOSYMLINK_REQUEST_TIMEOUT_SECONDS=15
+AUTOSYMLINK_REQUEST_BODY_JSON={}
 ```
 
 
@@ -179,6 +189,35 @@ Radarr 的 Torrent Blackhole Grab Webhook 不会提供磁力本体，但会提�
 - 内容出现等待 10 次后仍为空：停止该整理任务，并按离线 task id 或 BTIH 查询未完成离线/转存任务；若仍在进行则直接取消该任务，同时删除最初创建的空电影目录
 - 其它情况：保守跳过，避免误动复杂目录
 - 剧集目录不参与该整理流程
+
+### ani-rss 下载完成后刷新 Auto_Symlink
+
+本服务额外提供专用 WebHook：
+
+```text
+POST /webhook/ani-rss/autosymlink
+```
+
+在 ani-rss 通知设置中新增 WebHook，通知状态只勾选“下载完成”，body 使用 JSON：
+
+```json
+{
+  "action": "${action}",
+  "episode": "${episode}",
+  "totalEpisodeNumber": "${totalEpisodeNumber}",
+  "title": "${title}",
+  "season": "${season}",
+  "text": "${text}"
+}
+```
+
+触发规则：
+
+- `episode` 和 `totalEpisodeNumber` 必须存在、为正整数；缺失、为 0、解析失败或小数集都会返回 `200 OK` 并标记 `ignored=true`。
+- 只有 `episode == 1` 或 `episode >= totalEpisodeNumber` 时，才会按 `AUTOSYMLINK_NORMAL_DELAY_SECONDS` 延迟后调用 Auto_Symlink。
+- 中间集数会返回 `200 OK` 并标记 `ignored=true`，避免 ani-rss 把业务跳过当作通知失败。
+- Auto_Symlink 调用失败最多重试 `AUTOSYMLINK_RETRY_COUNT` 次，每次间隔 `AUTOSYMLINK_RETRY_DELAY_SECONDS` 秒。
+- Auto_Symlink HTTP 2xx 即视为调用成功，响应 body 只记录到容器日志。
 
 ## 📅 路线图
 

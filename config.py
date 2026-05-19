@@ -68,6 +68,26 @@ RADARR_REFRESH_CONFIRM_ENABLED = os.getenv("RADARR_REFRESH_CONFIRM_ENABLED", "tr
 RADARR_REFRESH_CONFIRM_POLL_INTERVAL = int(os.getenv("RADARR_REFRESH_CONFIRM_POLL_INTERVAL", "2"))
 RADARR_REFRESH_CONFIRM_MAX_ATTEMPTS = int(os.getenv("RADARR_REFRESH_CONFIRM_MAX_ATTEMPTS", "5"))
 
+# 10. 可选的 ani-rss 下载完成 -> Auto_Symlink 手动刷新桥接
+# 这个路径是 ani-rss 下载完成通知专用入口，不和 Radarr Grab webhook 混用。
+ANI_RSS_AUTOSYMLINK_WEBHOOK_PATH = "/webhook/ani-rss/autosymlink"
+
+# Auto_Symlink 的 Web 服务地址、专用 API Key、以及“PikPak Anime”手动刷新任务 UUID。
+AUTOSYMLINK_BASE_URL = os.getenv("AUTOSYMLINK_BASE_URL", "").rstrip("/")
+AUTOSYMLINK_API_KEY = os.getenv("AUTOSYMLINK_API_KEY", "").strip()
+AUTOSYMLINK_TASK_UUID = os.getenv("AUTOSYMLINK_TASK_UUID", "").strip()
+
+# CloudDrive2 / 挂载侧目录缓存可能滞后，所以下载完成后先延迟再刷新。
+AUTOSYMLINK_NORMAL_DELAY_SECONDS = int(os.getenv("AUTOSYMLINK_NORMAL_DELAY_SECONDS", "75"))
+
+# Auto_Symlink 调用失败时的轻量内存重试；不做持久化队列。
+AUTOSYMLINK_RETRY_COUNT = int(os.getenv("AUTOSYMLINK_RETRY_COUNT", "2"))
+AUTOSYMLINK_RETRY_DELAY_SECONDS = int(os.getenv("AUTOSYMLINK_RETRY_DELAY_SECONDS", "30"))
+AUTOSYMLINK_REQUEST_TIMEOUT_SECONDS = int(os.getenv("AUTOSYMLINK_REQUEST_TIMEOUT_SECONDS", "15"))
+
+# Auto_Symlink OpenAPI 未登录不可读，body 预留为可配置 JSON，默认空对象。
+AUTOSYMLINK_REQUEST_BODY_JSON = os.getenv("AUTOSYMLINK_REQUEST_BODY_JSON", "{}")
+
 VIDEO_EXTENSIONS = {
     ".3gp",
     ".avi",

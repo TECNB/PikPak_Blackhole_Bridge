@@ -7,7 +7,9 @@ from threading import Thread
 from urllib.parse import urlparse
 
 import state
+from autosymlink_client import evaluate_ani_rss_autosymlink_payload, schedule_autosymlink_refresh
 from config import (
+    ANI_RSS_AUTOSYMLINK_WEBHOOK_PATH,
     PENDING_TASK_FILE,
     WEBHOOK_HOST,
     WEBHOOK_MAX_BODY_BYTES,
@@ -157,6 +159,13 @@ def write_json_response(handler, status_code, payload):
     handler.wfile.write(body)
 
 
+class WebhookRequestError(Exception):
+    def __init__(self, status_code, message):
+        super().__init__(message)
+        self.status_code = status_code
+        self.message = message
+
+
 class WebhookRequestHandler(BaseHTTPRequestHandler):
     server_version = "PikPakBlackholeBridgeWebhook/1.0"
 
@@ -169,37 +178,107 @@ class WebhookRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path.rstrip("/") or "/"
+
+        # ani-rss 下载完成刷新是专用路径，先分流，避免被 Radarr Grab 校验误伤。
+        if path == ANI_RSS_AUTOSYMLINK_WEBHOOK_PATH:
+            self.handle_ani_rss_autosymlink()
+            return
+
         if path not in WEBHOOK_PATHS:
             write_json_response(self, 404, {"ok": False, "error": "not found"})
             return
 
+        self.handle_radarr_grab()
+
+    def read_json_payload(self):
+        """统一处理 JSON 协议校验；协议错误才返回 4xx。"""
+
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
-            write_json_response(self, 400, {"ok": False, "error": "invalid Content-Length"})
-            return
+            raise WebhookRequestError(400, "invalid Content-Length")
 
         if length <= 0:
-            write_json_response(self, 400, {"ok": False, "error": "empty body"})
-            return
+            raise WebhookRequestError(400, "empty body")
         if length > WEBHOOK_MAX_BODY_BYTES:
-            write_json_response(self, 413, {"ok": False, "error": "body too large"})
-            return
+            raise WebhookRequestError(413, "body too large")
 
         try:
             raw_body = self.rfile.read(length)
             payload = json.loads(raw_body.decode("utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("JSON body must be an object")
+            return payload
+        except json.JSONDecodeError as e:
+            raise WebhookRequestError(400, f"invalid json: {e}")
+        except ValueError as e:
+            raise WebhookRequestError(400, str(e))
 
+    def handle_radarr_grab(self):
+        """处理既有 Radarr Grab webhook，保持原有行为。"""
+
+        try:
+            payload = self.read_json_payload()
             result = register_radarr_grab(payload)
             write_json_response(self, 200, {"ok": True, **result})
-        except json.JSONDecodeError as e:
-            write_json_response(self, 400, {"ok": False, "error": f"invalid json: {e}"})
+        except WebhookRequestError as e:
+            write_json_response(self, e.status_code, {"ok": False, "error": e.message})
         except ValueError as e:
             write_json_response(self, 400, {"ok": False, "error": str(e)})
         except Exception as e:
             logger.error(f"[Webhook] 处理请求失败: {e}")
+            logger.error(traceback.format_exc())
+            write_json_response(self, 500, {"ok": False, "error": "internal server error"})
+
+    def handle_ani_rss_autosymlink(self):
+        """处理 ani-rss 下载完成通知，并按集数规则决定是否安排 AS 刷新。"""
+
+        try:
+            payload = self.read_json_payload()
+            decision = evaluate_ani_rss_autosymlink_payload(payload)
+
+            title = payload.get("title") or "未知番剧"
+            if decision.ignored:
+                # 业务跳过也返回 200，避免 ani-rss 把“中间集不刷新”记成通知失败。
+                log_method = logger.info if decision.reason == "middle episode" else logger.warning
+                log_method(
+                    "[Auto_Symlink] 已忽略 ani-rss 下载完成 webhook: "
+                    f"reason={decision.reason} title={title} "
+                    f"episode={payload.get('episode')} total={payload.get('totalEpisodeNumber')}"
+                )
+                write_json_response(
+                    self,
+                    200,
+                    {
+                        "ok": True,
+                        "ignored": True,
+                        "reason": decision.reason,
+                        "episode": decision.episode,
+                        "totalEpisodeNumber": decision.total_episode_number,
+                    },
+                )
+                return
+
+            # 调度成功只代表已安排延迟任务，不代表 Auto_Symlink 已经执行完成。
+            schedule = schedule_autosymlink_refresh(payload, decision)
+            write_json_response(
+                self,
+                200,
+                {
+                    "ok": True,
+                    "ignored": False,
+                    "scheduled": True,
+                    "reason": decision.reason,
+                    "trigger": decision.trigger,
+                    "episode": decision.episode,
+                    "totalEpisodeNumber": decision.total_episode_number,
+                    **schedule,
+                },
+            )
+        except WebhookRequestError as e:
+            write_json_response(self, e.status_code, {"ok": False, "error": e.message})
+        except Exception as e:
+            logger.error(f"[Auto_Symlink] 处理 ani-rss webhook 失败: {e}")
             logger.error(traceback.format_exc())
             write_json_response(self, 500, {"ok": False, "error": "internal server error"})
 
@@ -208,15 +287,15 @@ class WebhookRequestHandler(BaseHTTPRequestHandler):
 
 
 def start_webhook_server():
-    """启动 Radarr Grab webhook HTTP 服务。"""
+    """启动 webhook HTTP 服务。"""
     try:
         server = ThreadingHTTPServer((WEBHOOK_HOST, WEBHOOK_PORT), WebhookRequestHandler)
     except OSError as e:
         logger.error(f"[Webhook] 启动失败 {WEBHOOK_HOST}:{WEBHOOK_PORT}: {e}")
         return None
 
-    thread = Thread(target=server.serve_forever, name="radarr-webhook-server", daemon=True)
+    thread = Thread(target=server.serve_forever, name="webhook-server", daemon=True)
     thread.start()
-    paths = ", ".join(sorted(WEBHOOK_PATHS))
+    paths = ", ".join(sorted([*WEBHOOK_PATHS, ANI_RSS_AUTOSYMLINK_WEBHOOK_PATH]))
     logger.info(f"[Webhook] 已启动: http://{WEBHOOK_HOST}:{WEBHOOK_PORT} ({paths})")
     return server
