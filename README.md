@@ -214,9 +214,12 @@ POST /webhook/ani-rss/autosymlink
 
 触发规则：
 
-- `episode` 和 `totalEpisodeNumber` 必须存在、为正整数；缺失、为 0、解析失败或小数集都会返回 `200 OK` 并标记 `ignored=true`。
-- 只有 `episode == 1` 或 `episode >= totalEpisodeNumber` 时，才会按 `AUTOSYMLINK_NORMAL_DELAY_SECONDS` 延迟后调用 Auto_Symlink。
-- 中间集数会返回 `200 OK` 并标记 `ignored=true`，避免 ani-rss 把业务跳过当作通知失败。
+- `episode` 必须是正整数；缺失、为 0、解析失败或小数集会返回 `200 OK` 并标记 `ignored=true`。
+- `totalEpisodeNumber` 只作为声明总集数语义字段；为 0 时按未知总集数处理，缺失或解析失败只记录 warning，不阻止正整数 `episode` 触发刷新。
+- 所有正整数 `episode` 下载完成都会进入全局合并刷新，而不是只刷新首集或声明末集。
+- 全局没有待执行刷新任务时，会按 `AUTOSYMLINK_NORMAL_DELAY_SECONDS` 延迟后调用 Auto_Symlink。
+- 全局已有待执行刷新任务时，新 WebHook 合并到该任务，不重置倒计时；响应会返回 `scheduled=false`、`merged=true` 和已有 `job`。
+- 待执行刷新开始调用 Auto_Symlink 前会释放 pending 槽位；如果刷新正在执行时又收到新 WebHook，可以安排下一次延迟刷新。
 - Auto_Symlink 调用失败最多重试 `AUTOSYMLINK_RETRY_COUNT` 次，每次间隔 `AUTOSYMLINK_RETRY_DELAY_SECONDS` 秒。
 - Auto_Symlink HTTP 2xx 即视为调用成功，响应 body 只记录到容器日志。
 

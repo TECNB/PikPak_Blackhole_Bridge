@@ -239,9 +239,8 @@ class WebhookRequestHandler(BaseHTTPRequestHandler):
 
             title = payload.get("title") or "未知番剧"
             if decision.ignored:
-                # 业务跳过也返回 200，避免 ani-rss 把“中间集不刷新”记成通知失败。
-                log_method = logger.info if decision.reason == "middle episode" else logger.warning
-                log_method(
+                # 业务跳过也返回 200，避免 ani-rss 把集数字段问题记成通知失败。
+                logger.warning(
                     "[Auto_Symlink] 已忽略 ani-rss 下载完成 webhook: "
                     f"reason={decision.reason} title={title} "
                     f"episode={payload.get('episode')} total={payload.get('totalEpisodeNumber')}"
@@ -259,6 +258,13 @@ class WebhookRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
 
+            if decision.total_episode_number_warning:
+                logger.warning(
+                    "[Auto_Symlink] totalEpisodeNumber 无法用于末集语义，将按普通集数刷新: "
+                    f"reason={decision.total_episode_number_warning} title={title} "
+                    f"episode={payload.get('episode')} total={payload.get('totalEpisodeNumber')}"
+                )
+
             # 调度成功只代表已安排延迟任务，不代表 Auto_Symlink 已经执行完成。
             schedule = schedule_autosymlink_refresh(payload, decision)
             write_json_response(
@@ -267,8 +273,7 @@ class WebhookRequestHandler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "ignored": False,
-                    "scheduled": True,
-                    "reason": decision.reason,
+                    "reason": "merged into pending refresh" if schedule.get("merged") else decision.reason,
                     "trigger": decision.trigger,
                     "episode": decision.episode,
                     "totalEpisodeNumber": decision.total_episode_number,

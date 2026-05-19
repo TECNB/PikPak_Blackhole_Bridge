@@ -2,6 +2,7 @@ import os
 import sys
 import types
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -59,6 +60,24 @@ class FakeHandler:
         return self.payload
 
 
+class FakeThread:
+    started = []
+
+    def __init__(self, target, args, name, daemon):
+        self.target = target
+        self.args = args
+        self.name = name
+        self.daemon = daemon
+
+    def start(self):
+        self.started.append(self)
+
+
+def reset_autosymlink_pending_job():
+    with autosymlink_client.AUTOSYMLINK_SCHEDULE_LOCK:
+        autosymlink_client.AUTOSYMLINK_PENDING_JOB = None
+
+
 class AutoSymlinkDecisionTests(unittest.TestCase):
     def test_first_episode_triggers_refresh(self):
         decision = autosymlink_client.evaluate_ani_rss_autosymlink_payload(
@@ -86,14 +105,15 @@ class AutoSymlinkDecisionTests(unittest.TestCase):
         self.assertTrue(decision.should_refresh)
         self.assertEqual(decision.trigger, "first_episode")
 
-    def test_middle_episode_is_ignored(self):
+    def test_middle_episode_triggers_refresh(self):
         decision = autosymlink_client.evaluate_ani_rss_autosymlink_payload(
             {"episode": "6", "totalEpisodeNumber": "12"}
         )
 
-        self.assertFalse(decision.should_refresh)
-        self.assertTrue(decision.ignored)
-        self.assertEqual(decision.reason, "middle episode")
+        self.assertTrue(decision.should_refresh)
+        self.assertFalse(decision.ignored)
+        self.assertEqual(decision.trigger, "episode")
+        self.assertEqual(decision.reason, "episode")
 
     def test_fractional_episode_is_ignored(self):
         decision = autosymlink_client.evaluate_ani_rss_autosymlink_payload(
@@ -103,13 +123,36 @@ class AutoSymlinkDecisionTests(unittest.TestCase):
         self.assertFalse(decision.should_refresh)
         self.assertIn("integer", decision.reason)
 
-    def test_zero_total_is_ignored(self):
+    def test_zero_total_triggers_unknown_total_refresh(self):
         decision = autosymlink_client.evaluate_ani_rss_autosymlink_payload(
-            {"episode": "1", "totalEpisodeNumber": "0"}
+            {"episode": "2", "totalEpisodeNumber": "0"}
         )
 
-        self.assertFalse(decision.should_refresh)
-        self.assertIn("positive", decision.reason)
+        self.assertTrue(decision.should_refresh)
+        self.assertFalse(decision.ignored)
+        self.assertEqual(decision.total_episode_number, None)
+        self.assertEqual(decision.trigger, "unknown_total_episode")
+        self.assertEqual(decision.total_episode_number_warning, None)
+
+    def test_missing_total_still_triggers_refresh_with_warning(self):
+        decision = autosymlink_client.evaluate_ani_rss_autosymlink_payload(
+            {"episode": "2"}
+        )
+
+        self.assertTrue(decision.should_refresh)
+        self.assertFalse(decision.ignored)
+        self.assertEqual(decision.trigger, "unknown_total_episode")
+        self.assertEqual(decision.total_episode_number_warning, "totalEpisodeNumber missing")
+
+    def test_invalid_total_still_triggers_refresh_with_warning(self):
+        decision = autosymlink_client.evaluate_ani_rss_autosymlink_payload(
+            {"episode": "2", "totalEpisodeNumber": "abc"}
+        )
+
+        self.assertTrue(decision.should_refresh)
+        self.assertFalse(decision.ignored)
+        self.assertEqual(decision.trigger, "unknown_total_episode")
+        self.assertEqual(decision.total_episode_number_warning, "totalEpisodeNumber invalid")
 
     def test_nan_episode_is_ignored(self):
         decision = autosymlink_client.evaluate_ani_rss_autosymlink_payload(
@@ -118,6 +161,66 @@ class AutoSymlinkDecisionTests(unittest.TestCase):
 
         self.assertFalse(decision.should_refresh)
         self.assertIn("invalid", decision.reason)
+
+
+class AutoSymlinkScheduleTests(unittest.TestCase):
+    def setUp(self):
+        reset_autosymlink_pending_job()
+        FakeThread.started = []
+
+    def tearDown(self):
+        reset_autosymlink_pending_job()
+        FakeThread.started = []
+
+    def test_pending_refresh_merges_next_webhook(self):
+        first_decision = autosymlink_client.evaluate_ani_rss_autosymlink_payload(
+            {"episode": "1", "totalEpisodeNumber": "0"}
+        )
+        next_decision = autosymlink_client.evaluate_ani_rss_autosymlink_payload(
+            {"episode": "2", "totalEpisodeNumber": "0"}
+        )
+
+        with patch.object(autosymlink_client, "Thread", FakeThread):
+            first = autosymlink_client.schedule_autosymlink_refresh(
+                {"title": "Anime", "season": 1},
+                first_decision,
+            )
+            second = autosymlink_client.schedule_autosymlink_refresh(
+                {"title": "Anime", "season": 1},
+                next_decision,
+            )
+
+        self.assertTrue(first["scheduled"])
+        self.assertFalse(first["merged"])
+        self.assertFalse(second["scheduled"])
+        self.assertTrue(second["merged"])
+        self.assertEqual(first["job"], second["job"])
+        self.assertEqual(len(FakeThread.started), 1)
+
+    def test_running_refresh_allows_next_pending_job(self):
+        first_decision = autosymlink_client.evaluate_ani_rss_autosymlink_payload(
+            {"episode": "1", "totalEpisodeNumber": "0"}
+        )
+        next_decision = autosymlink_client.evaluate_ani_rss_autosymlink_payload(
+            {"episode": "2", "totalEpisodeNumber": "0"}
+        )
+
+        with patch.object(autosymlink_client, "Thread", FakeThread):
+            first = autosymlink_client.schedule_autosymlink_refresh(
+                {"title": "Anime", "season": 1},
+                first_decision,
+            )
+            autosymlink_client.mark_autosymlink_refresh_running(first["job"])
+            second = autosymlink_client.schedule_autosymlink_refresh(
+                {"title": "Anime", "season": 1},
+                next_decision,
+            )
+
+        self.assertTrue(first["scheduled"])
+        self.assertTrue(second["scheduled"])
+        self.assertFalse(second["merged"])
+        self.assertNotEqual(first["job"], second["job"])
+        self.assertEqual(len(FakeThread.started), 2)
 
 
 class AutoSymlinkRequestTests(unittest.TestCase):
@@ -185,7 +288,12 @@ class AutoSymlinkWebhookTests(unittest.TestCase):
 
         def fake_scheduler(payload, decision):
             self.schedules.append((payload, decision))
-            return {"job": "test-job", "delay_seconds": 75}
+            return {
+                "job": "test-job",
+                "delay_seconds": 75,
+                "scheduled": True,
+                "merged": False,
+            }
 
         def fake_writer(handler, status_code, payload):
             self.responses.append((status_code, payload))
@@ -214,15 +322,39 @@ class AutoSymlinkWebhookTests(unittest.TestCase):
         self.assertEqual(payload["trigger"], "first_episode")
         self.assertEqual(len(self.schedules), 1)
 
-    def test_webhook_ignores_middle_episode(self):
+    def test_webhook_schedules_middle_episode(self):
         status, payload = self.handle_payload(
             {"episode": "6", "totalEpisodeNumber": "12", "title": "Anime"}
         )
 
         self.assertEqual(status, 200)
-        self.assertTrue(payload["ignored"])
-        self.assertEqual(payload["reason"], "middle episode")
-        self.assertEqual(self.schedules, [])
+        self.assertFalse(payload["ignored"])
+        self.assertTrue(payload["scheduled"])
+        self.assertEqual(payload["reason"], "episode")
+        self.assertEqual(len(self.schedules), 1)
+
+    def test_webhook_reports_merged_refresh(self):
+        def fake_merged_scheduler(payload, decision):
+            self.schedules.append((payload, decision))
+            return {
+                "job": "test-job",
+                "delay_seconds": 75,
+                "scheduled": False,
+                "merged": True,
+            }
+
+        webhook.schedule_autosymlink_refresh = fake_merged_scheduler
+
+        status, payload = self.handle_payload(
+            {"episode": "2", "totalEpisodeNumber": "0", "title": "Anime"}
+        )
+
+        self.assertEqual(status, 200)
+        self.assertFalse(payload["ignored"])
+        self.assertFalse(payload["scheduled"])
+        self.assertTrue(payload["merged"])
+        self.assertEqual(payload["reason"], "merged into pending refresh")
+        self.assertEqual(len(self.schedules), 1)
 
     def test_webhook_rejects_invalid_json(self):
         status, payload = self.handle_payload(

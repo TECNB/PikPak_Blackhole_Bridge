@@ -3,7 +3,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from threading import Thread
+from threading import Lock, Thread
 from typing import Optional
 from urllib.parse import quote
 
@@ -33,49 +33,76 @@ class AutoSymlinkDecision:
     episode: Optional[int] = None
     total_episode_number: Optional[int] = None
     trigger: Optional[str] = None
+    total_episode_number_warning: Optional[str] = None
 
 
-def parse_positive_integer_episode(value, field_name):
-    """解析 ani-rss 集数字段，只接受正整数，拒绝 0、小数和异常值。"""
+AUTOSYMLINK_SCHEDULE_LOCK = Lock()
+AUTOSYMLINK_PENDING_JOB = None
+
+
+def parse_integer_episode_value(value, field_name):
+    """解析 ani-rss 集数字段，只接受整数，拒绝空值、小数和异常值。"""
 
     # ani-rss WebHook 模板通常把变量渲染成字符串；Decimal 可以稳定区分
     # "1"、"1.0"、"1.5"、"NaN"，避免 float 带来的隐式取整或精度问题。
     if value is None or isinstance(value, bool):
         raise ValueError(f"{field_name} missing")
 
+    text = str(value).strip()
+    if not text:
+        raise ValueError(f"{field_name} missing")
+
     try:
-        number = Decimal(str(value).strip())
-    except (InvalidOperation, AttributeError):
+        number = Decimal(text)
+    except InvalidOperation:
         raise ValueError(f"{field_name} invalid")
 
     if not number.is_finite():
         raise ValueError(f"{field_name} invalid")
-    if number <= 0:
-        raise ValueError(f"{field_name} must be positive")
     if number != number.to_integral_value():
         raise ValueError(f"{field_name} must be an integer")
 
     return int(number)
 
 
-def evaluate_ani_rss_autosymlink_payload(payload):
-    """执行 MVP 刷新规则：只在首集或声明总集数的最后一集刷新。"""
+def parse_positive_integer_episode(value, field_name):
+    """解析 ani-rss 当前集数，只接受正整数，拒绝 0、小数和异常值。"""
 
-    # 缺字段、0、小数、解析失败都属于业务跳过，不让 ani-rss 认为 WebHook 失败。
+    number = parse_integer_episode_value(value, field_name)
+    if number <= 0:
+        raise ValueError(f"{field_name} must be positive")
+    return number
+
+
+def parse_optional_total_episode_number(value):
+    """解析声明总集数；0 表示未知总集数，不再作为刷新拦截条件。"""
+
+    try:
+        total_episode_number = parse_integer_episode_value(value, "totalEpisodeNumber")
+    except ValueError as e:
+        return None, str(e)
+
+    if total_episode_number < 0:
+        return None, "totalEpisodeNumber invalid"
+    if total_episode_number == 0:
+        return None, None
+    return total_episode_number, None
+
+
+def evaluate_ani_rss_autosymlink_payload(payload):
+    """执行刷新规则：正整数集下载完成都进入全局合并刷新。"""
+
+    # episode 是刷新资格字段；无法确认正整数集时才业务跳过。
     try:
         episode = parse_positive_integer_episode(payload.get("episode"), "episode")
     except ValueError as e:
         return AutoSymlinkDecision(False, True, str(e))
 
-    try:
-        total_episode_number = parse_positive_integer_episode(
-            payload.get("totalEpisodeNumber"),
-            "totalEpisodeNumber",
-        )
-    except ValueError as e:
-        return AutoSymlinkDecision(False, True, str(e), episode=episode)
+    total_episode_number, total_warning = parse_optional_total_episode_number(
+        payload.get("totalEpisodeNumber"),
+    )
 
-    # 单集番会先命中首集规则，同一次 WebHook 只安排一次刷新。
+    # totalEpisodeNumber 是声明总集数，不代表当前已更新到多少；只用于日志语义。
     if episode == 1:
         return AutoSymlinkDecision(
             True,
@@ -84,10 +111,10 @@ def evaluate_ani_rss_autosymlink_payload(payload):
             episode=episode,
             total_episode_number=total_episode_number,
             trigger="first_episode",
+            total_episode_number_warning=total_warning,
         )
 
-    # totalEpisodeNumber 是订阅声明总集数，不证明中间集完整；这里只按 MVP 做末集刷新。
-    if episode >= total_episode_number:
+    if total_episode_number and episode >= total_episode_number:
         return AutoSymlinkDecision(
             True,
             False,
@@ -95,24 +122,56 @@ def evaluate_ani_rss_autosymlink_payload(payload):
             episode=episode,
             total_episode_number=total_episode_number,
             trigger="final_episode",
+            total_episode_number_warning=total_warning,
         )
 
-    # 中间集不刷新，避免 Auto_Symlink 被每集下载完成通知打爆。
+    if total_episode_number is None:
+        return AutoSymlinkDecision(
+            True,
+            False,
+            "unknown total episode",
+            episode=episode,
+            total_episode_number=None,
+            trigger="unknown_total_episode",
+            total_episode_number_warning=total_warning,
+        )
+
     return AutoSymlinkDecision(
-        False,
         True,
-        "middle episode",
+        False,
+        "episode",
         episode=episode,
         total_episode_number=total_episode_number,
+        trigger="episode",
+        total_episode_number_warning=total_warning,
     )
 
 
 def schedule_autosymlink_refresh(payload, decision):
-    """把刷新任务放入内存线程，立刻给 ani-rss 返回 200。"""
+    """把刷新任务放入内存线程；已有待执行任务时全局合并。"""
 
+    global AUTOSYMLINK_PENDING_JOB
     title = str(payload.get("title") or "未知番剧")
     season = payload.get("season")
-    job_name = f"as-refresh-ep{decision.episode}-total{decision.total_episode_number}-{int(time.time())}"
+    total = decision.total_episode_number if decision.total_episode_number is not None else "unknown"
+
+    with AUTOSYMLINK_SCHEDULE_LOCK:
+        if AUTOSYMLINK_PENDING_JOB:
+            logger.info(
+                "[Auto_Symlink] 已合并到待执行刷新: "
+                f"title={title} season={season} episode={decision.episode}/"
+                f"{total} trigger={decision.trigger} job={AUTOSYMLINK_PENDING_JOB}"
+            )
+            return {
+                "job": AUTOSYMLINK_PENDING_JOB,
+                "delay_seconds": AUTOSYMLINK_NORMAL_DELAY_SECONDS,
+                "scheduled": False,
+                "merged": True,
+            }
+
+        job_name = f"as-refresh-{time.time_ns()}"
+        AUTOSYMLINK_PENDING_JOB = job_name
+
     context = {
         "title": title,
         "season": season,
@@ -129,15 +188,26 @@ def schedule_autosymlink_refresh(payload, decision):
         name=job_name,
         daemon=True,
     )
-    thread.start()
+    try:
+        thread.start()
+    except Exception:
+        with AUTOSYMLINK_SCHEDULE_LOCK:
+            if AUTOSYMLINK_PENDING_JOB == job_name:
+                AUTOSYMLINK_PENDING_JOB = None
+        raise
 
     logger.info(
         "[Auto_Symlink] 已安排延迟刷新: "
         f"title={title} season={season} episode={decision.episode}/"
-        f"{decision.total_episode_number} trigger={decision.trigger} "
+        f"{total} trigger={decision.trigger} "
         f"delay={AUTOSYMLINK_NORMAL_DELAY_SECONDS}s job={job_name}"
     )
-    return {"job": job_name, "delay_seconds": AUTOSYMLINK_NORMAL_DELAY_SECONDS}
+    return {
+        "job": job_name,
+        "delay_seconds": AUTOSYMLINK_NORMAL_DELAY_SECONDS,
+        "scheduled": True,
+        "merged": False,
+    }
 
 
 def run_delayed_autosymlink_refresh(context):
@@ -148,10 +218,20 @@ def run_delayed_autosymlink_refresh(context):
         time.sleep(delay)
 
     try:
+        mark_autosymlink_refresh_running(context.get("job_name"))
         trigger_autosymlink_refresh_with_retries(context)
     except Exception as e:
         logger.error(f"[Auto_Symlink] 延迟刷新任务异常: {e}")
         logger.error(traceback.format_exc())
+
+
+def mark_autosymlink_refresh_running(job_name):
+    """待执行任务开始调用 AS 前释放 pending 槽位，允许新 webhook 排下一次刷新。"""
+
+    global AUTOSYMLINK_PENDING_JOB
+    with AUTOSYMLINK_SCHEDULE_LOCK:
+        if AUTOSYMLINK_PENDING_JOB == job_name:
+            AUTOSYMLINK_PENDING_JOB = None
 
 
 def trigger_autosymlink_refresh_with_retries(context):
