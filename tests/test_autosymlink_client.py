@@ -125,12 +125,14 @@ class AutoSymlinkRequestTests(unittest.TestCase):
         self.original = {
             "base_url": autosymlink_client.AUTOSYMLINK_BASE_URL,
             "api_key": autosymlink_client.AUTOSYMLINK_API_KEY,
+            "cookie": autosymlink_client.AUTOSYMLINK_COOKIE,
             "task_uuid": autosymlink_client.AUTOSYMLINK_TASK_UUID,
             "body_json": autosymlink_client.AUTOSYMLINK_REQUEST_BODY_JSON,
             "timeout": autosymlink_client.AUTOSYMLINK_REQUEST_TIMEOUT_SECONDS,
         }
         autosymlink_client.AUTOSYMLINK_BASE_URL = "http://autos.example:8095"
         autosymlink_client.AUTOSYMLINK_API_KEY = "secret-for-test"
+        autosymlink_client.AUTOSYMLINK_COOKIE = "authenticated=true"
         autosymlink_client.AUTOSYMLINK_TASK_UUID = "db3bc5a7-2864-4e78-8131-636c8d1b5e0c"
         autosymlink_client.AUTOSYMLINK_REQUEST_BODY_JSON = '{"mode":"manual"}'
         autosymlink_client.AUTOSYMLINK_REQUEST_TIMEOUT_SECONDS = 9
@@ -138,6 +140,7 @@ class AutoSymlinkRequestTests(unittest.TestCase):
     def tearDown(self):
         autosymlink_client.AUTOSYMLINK_BASE_URL = self.original["base_url"]
         autosymlink_client.AUTOSYMLINK_API_KEY = self.original["api_key"]
+        autosymlink_client.AUTOSYMLINK_COOKIE = self.original["cookie"]
         autosymlink_client.AUTOSYMLINK_TASK_UUID = self.original["task_uuid"]
         autosymlink_client.AUTOSYMLINK_REQUEST_BODY_JSON = self.original["body_json"]
         autosymlink_client.AUTOSYMLINK_REQUEST_TIMEOUT_SECONDS = self.original["timeout"]
@@ -160,6 +163,7 @@ class AutoSymlinkRequestTests(unittest.TestCase):
         self.assertEqual(call["json"], {"mode": "manual"})
         self.assertEqual(call["headers"]["X-API-Key"], "secret-for-test")
         self.assertEqual(call["headers"]["Authorization"], "Bearer secret-for-test")
+        self.assertEqual(call["headers"]["Cookie"], "authenticated=true")
         self.assertEqual(call["timeout"], 9)
 
     def test_missing_config_does_not_call_autosymlink(self):

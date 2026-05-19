@@ -149,6 +149,7 @@ RADARR_REFRESH_CONFIRM_MAX_ATTEMPTS=5
 # 可选: ani-rss 下载完成后触发 Auto_Symlink 手动刷新
 AUTOSYMLINK_BASE_URL=http://your-autosymlink-host:8095
 AUTOSYMLINK_API_KEY=your_autosymlink_api_key_here
+AUTOSYMLINK_COOKIE=authenticated=true
 AUTOSYMLINK_TASK_UUID=your_autosymlink_task_uuid_here
 AUTOSYMLINK_NORMAL_DELAY_SECONDS=75
 AUTOSYMLINK_RETRY_COUNT=2

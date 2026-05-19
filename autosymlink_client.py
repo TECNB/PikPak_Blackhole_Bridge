@@ -12,6 +12,7 @@ import requests
 from config import (
     AUTOSYMLINK_API_KEY,
     AUTOSYMLINK_BASE_URL,
+    AUTOSYMLINK_COOKIE,
     AUTOSYMLINK_NORMAL_DELAY_SECONDS,
     AUTOSYMLINK_REQUEST_BODY_JSON,
     AUTOSYMLINK_REQUEST_TIMEOUT_SECONDS,
@@ -245,6 +246,9 @@ def build_autosymlink_headers():
         # 不同部署可能读取不同 API Key header；同时发送两种常见形式，日志不会输出 key。
         headers["X-API-Key"] = AUTOSYMLINK_API_KEY
         headers["Authorization"] = f"Bearer {AUTOSYMLINK_API_KEY}"
+    if AUTOSYMLINK_COOKIE:
+        # Auto_Symlink 的 common_tools UI 接口需要网页登录 cookie；该值只从环境变量读取。
+        headers["Cookie"] = AUTOSYMLINK_COOKIE
     return headers
 
 

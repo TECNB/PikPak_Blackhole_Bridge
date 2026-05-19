@@ -76,6 +76,7 @@ ANI_RSS_AUTOSYMLINK_WEBHOOK_PATH = "/webhook/ani-rss/autosymlink"
 AUTOSYMLINK_BASE_URL = os.getenv("AUTOSYMLINK_BASE_URL", "").rstrip("/")
 AUTOSYMLINK_API_KEY = os.getenv("AUTOSYMLINK_API_KEY", "").strip()
 AUTOSYMLINK_TASK_UUID = os.getenv("AUTOSYMLINK_TASK_UUID", "").strip()
+AUTOSYMLINK_COOKIE = os.getenv("AUTOSYMLINK_COOKIE", "").strip()
 
 # CloudDrive2 / 挂载侧目录缓存可能滞后，所以下载完成后先延迟再刷新。
 AUTOSYMLINK_NORMAL_DELAY_SECONDS = int(os.getenv("AUTOSYMLINK_NORMAL_DELAY_SECONDS", "75"))
